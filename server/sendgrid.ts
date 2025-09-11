@@ -18,7 +18,7 @@ interface EmailParams {
 }
 
 export async function sendEmail(
-  apiKey: string,
+  apiKey: string | undefined,
   params: EmailParams
 ): Promise<boolean> {
   if (!process.env.SENDGRID_API_KEY) {
@@ -27,13 +27,25 @@ export async function sendEmail(
   }
 
   try {
-    await mailService.send({
+    const emailData: any = {
       to: params.to,
       from: params.from,
       subject: params.subject,
-      text: params.text,
-      html: params.html,
-    });
+    };
+
+    if (params.text) {
+      emailData.text = params.text;
+    }
+    if (params.html) {
+      emailData.html = params.html;
+    }
+
+    // Ensure at least text or html is provided
+    if (!params.text && !params.html) {
+      emailData.text = params.subject; // fallback to subject as text
+    }
+
+    await mailService.send(emailData);
     console.log(`Email sent successfully to ${params.to}`);
     return true;
   } catch (error) {

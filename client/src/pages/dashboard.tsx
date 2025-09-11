@@ -17,17 +17,17 @@ export default function Dashboard() {
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
   const { toast } = useToast();
 
-  const { data: servers, refetch: refetchServers } = useQuery({
+  const { data: servers = [], refetch: refetchServers } = useQuery({
     queryKey: ["/api/servers"],
     refetchInterval: 30000,
   });
 
-  const { data: stats } = useQuery({
+  const { data: stats = {} } = useQuery({
     queryKey: ["/api/stats"],
     refetchInterval: 30000,
   });
 
-  const { data: alerts } = useQuery({
+  const { data: alerts = [] } = useQuery({
     queryKey: ["/api/alerts"],
     refetchInterval: 10000,
   });
@@ -44,10 +44,10 @@ export default function Dashboard() {
     },
   });
 
-  const filteredServers = servers?.filter((server: any) => {
+  const filteredServers = servers.filter((server: any) => {
     if (filter === "all") return true;
     return server.status === filter;
-  }) || [];
+  });
 
   const sortedServers = [...filteredServers].sort((a: any, b: any) => {
     switch (sortBy) {
@@ -62,8 +62,8 @@ export default function Dashboard() {
     }
   });
 
-  const activeAlerts = alerts?.filter((alert: any) => !alert.resolvedAt) || [];
-  const recentAlerts = alerts?.slice(0, 3) || [];
+  const activeAlerts = alerts.filter((alert: any) => !alert.resolvedAt);
+  const recentAlerts = alerts.slice(0, 3);
 
   const handleRefresh = async () => {
     await refetchServers();
@@ -87,7 +87,7 @@ export default function Dashboard() {
               <div>
                 <p className="text-muted-foreground text-sm">Total GPUs</p>
                 <p className="text-3xl font-bold text-foreground" data-testid="stat-total-gpus">
-                  {stats?.totalGpus || 0}
+                  {stats.totalGpus || 0}
                 </p>
               </div>
               <div className="w-12 h-12 bg-chart-1/20 rounded-lg flex items-center justify-center">
@@ -108,7 +108,7 @@ export default function Dashboard() {
               <div>
                 <p className="text-muted-foreground text-sm">Avg GPU Util</p>
                 <p className="text-3xl font-bold text-foreground" data-testid="stat-avg-gpu-util">
-                  {stats?.avgGpuUtil || 0}%
+                  {stats.avgGpuUtil || 0}%
                 </p>
               </div>
               <div className="w-12 h-12 bg-chart-2/20 rounded-lg flex items-center justify-center">
@@ -150,7 +150,7 @@ export default function Dashboard() {
               <div>
                 <p className="text-muted-foreground text-sm">Power Usage</p>
                 <p className="text-3xl font-bold text-foreground" data-testid="stat-total-power">
-                  {stats?.totalPowerKW || 0}kW
+                  {stats.totalPowerKW || 0}kW
                 </p>
               </div>
               <div className="w-12 h-12 bg-chart-3/20 rounded-lg flex items-center justify-center">

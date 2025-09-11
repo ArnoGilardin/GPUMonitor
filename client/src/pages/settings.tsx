@@ -362,7 +362,7 @@ export default function Settings() {
                             )}
                           </div>
                           <p className="text-sm text-muted-foreground">
-                            {rule.type.replace("_", " ").toUpperCase()} > {rule.threshold}
+                            {rule.type.replace("_", " ").toUpperCase()} {'>'} {rule.threshold}
                             {rule.type.includes("temp") ? "°C" : "%"} for {rule.durationSec}s
                           </p>
                         </div>

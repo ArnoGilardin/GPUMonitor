@@ -14,12 +14,12 @@ export default function Alerts() {
   const [search, setSearch] = useState("");
   const [showResolved, setShowResolved] = useState(false);
 
-  const { data: alerts } = useQuery({
+  const { data: alerts = [] } = useQuery({
     queryKey: ["/api/alerts"],
     refetchInterval: 10000,
   });
 
-  const filteredAlerts = alerts?.filter((alert: any) => {
+  const filteredAlerts = alerts.filter((alert: any) => {
     // Filter by resolved status
     if (!showResolved && alert.resolvedAt) return false;
     if (showResolved && !alert.resolvedAt) return false;
@@ -34,13 +34,13 @@ export default function Alerts() {
     }
     
     return true;
-  }) || [];
+  });
 
   const alertStats = {
-    total: alerts?.length || 0,
-    active: alerts?.filter((a: any) => !a.resolvedAt).length || 0,
-    critical: alerts?.filter((a: any) => !a.resolvedAt && a.level === "critical").length || 0,
-    warning: alerts?.filter((a: any) => !a.resolvedAt && a.level === "warning").length || 0,
+    total: alerts.length,
+    active: alerts.filter((a: any) => !a.resolvedAt).length,
+    critical: alerts.filter((a: any) => !a.resolvedAt && a.level === "critical").length,
+    warning: alerts.filter((a: any) => !a.resolvedAt && a.level === "warning").length,
   };
 
   return (

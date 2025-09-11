@@ -6,17 +6,17 @@ import { cn } from "@/lib/utils";
 export default function Sidebar() {
   const [location] = useLocation();
   
-  const { data: stats } = useQuery({
+  const { data: stats = {} } = useQuery({
     queryKey: ["/api/stats"],
     refetchInterval: 30000,
-  });
+  }) as { data: any };
 
-  const { data: alerts } = useQuery({
+  const { data: alerts = [] } = useQuery({
     queryKey: ["/api/alerts"],
     refetchInterval: 10000,
-  });
+  }) as { data: any[] };
 
-  const activeAlerts = alerts?.filter((alert: any) => !alert.resolvedAt) || [];
+  const activeAlerts = alerts.filter((alert: any) => !alert.resolvedAt);
 
   const navItems = [
     { path: "/", icon: TrendingUp, label: "Dashboard" },
@@ -73,13 +73,13 @@ export default function Sidebar() {
             <div className="flex justify-between text-sm">
               <span className="text-muted-foreground">Total Servers</span>
               <span className="font-medium text-sidebar-foreground" data-testid="stat-total-servers">
-                {stats?.totalServers || 0}
+                {stats.totalServers || 0}
               </span>
             </div>
             <div className="flex justify-between text-sm">
               <span className="text-muted-foreground">Online</span>
               <span className="font-medium text-success" data-testid="stat-online-servers">
-                {stats?.onlineServers || 0}
+                {stats.onlineServers || 0}
               </span>
             </div>
             <div className="flex justify-between text-sm">

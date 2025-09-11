@@ -16,12 +16,12 @@ export default function Header({
 }: HeaderProps) {
   const { user, logout } = useAuth();
   
-  const { data: alerts } = useQuery({
+  const { data: alerts = [] } = useQuery({
     queryKey: ["/api/alerts"],
     refetchInterval: 10000,
-  });
+  }) as { data: any[] };
 
-  const activeAlerts = alerts?.filter((alert: any) => !alert.resolvedAt) || [];
+  const activeAlerts = alerts.filter((alert: any) => !alert.resolvedAt);
 
   return (
     <header className="bg-card border-b border-border p-6">

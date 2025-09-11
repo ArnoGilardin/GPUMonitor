@@ -23,12 +23,12 @@ export async function checkAlerts(serverId: string) {
 
     for (const rule of rules) {
       let value: number | undefined;
-      let message: string;
+      let message: string = "";
 
       switch (rule.type) {
         case "gpu_temp":
           if (latestMetrics.gpuSnapshots.length > 0) {
-            const maxTemp = Math.max(...latestMetrics.gpuSnapshots.map(g => parseFloat(g.tempC || "0")));
+            const maxTemp = Math.max(...latestMetrics.gpuSnapshots.map((g: any) => parseFloat(g.tempC || "0")));
             value = maxTemp;
             message = `GPU temperature reached ${maxTemp}°C, exceeding threshold of ${rule.threshold}°C`;
           }
@@ -36,7 +36,7 @@ export async function checkAlerts(serverId: string) {
         
         case "gpu_util":
           if (latestMetrics.gpuSnapshots.length > 0) {
-            const avgUtil = latestMetrics.gpuSnapshots.reduce((sum, g) => sum + parseFloat(g.utilPercent || "0"), 0) / latestMetrics.gpuSnapshots.length;
+            const avgUtil = latestMetrics.gpuSnapshots.reduce((sum: number, g: any) => sum + parseFloat(g.utilPercent || "0"), 0) / latestMetrics.gpuSnapshots.length;
             value = avgUtil;
             message = `GPU utilization reached ${avgUtil.toFixed(1)}%, exceeding threshold of ${rule.threshold}%`;
           }
@@ -44,7 +44,7 @@ export async function checkAlerts(serverId: string) {
         
         case "vram_util":
           if (latestMetrics.gpuSnapshots.length > 0) {
-            const avgVramUtil = latestMetrics.gpuSnapshots.reduce((sum, g) => {
+            const avgVramUtil = latestMetrics.gpuSnapshots.reduce((sum: number, g: any) => {
               const used = g.vramUsedMB || 0;
               const total = g.vramTotalMB || 1;
               return sum + (used / total) * 100;

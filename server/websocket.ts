@@ -14,7 +14,7 @@ export function setupWebSocket(server: Server) {
   const wss = new WebSocketServer({ 
     server, 
     path: "/ws",
-    verifyClient: (info) => {
+    verifyClient: (info: any) => {
       const url = new URL(info.req.url!, `http://${info.req.headers.host}`);
       const token = url.searchParams.get("token");
       

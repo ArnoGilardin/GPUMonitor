@@ -253,7 +253,7 @@ export class DatabaseStorage implements IStorage {
   }
 
   async getAlerts(resolved?: boolean): Promise<Alert[]> {
-    let query = db
+    const baseQuery = db
       .select({
         id: alerts.id,
         serverId: alerts.serverId,
@@ -274,12 +274,16 @@ export class DatabaseStorage implements IStorage {
       .leftJoin(rules, eq(alerts.ruleId, rules.id));
 
     if (resolved === true) {
-      query = query.where(sql`${alerts.resolvedAt} IS NOT NULL`);
+      return baseQuery
+        .where(sql`${alerts.resolvedAt} IS NOT NULL`)
+        .orderBy(desc(alerts.firedAt));
     } else if (resolved === false) {
-      query = query.where(isNull(alerts.resolvedAt));
+      return baseQuery
+        .where(isNull(alerts.resolvedAt))
+        .orderBy(desc(alerts.firedAt));
     }
 
-    return query.orderBy(desc(alerts.firedAt));
+    return baseQuery.orderBy(desc(alerts.firedAt));
   }
 
   async getActiveAlert(serverId: string, ruleId: string): Promise<Alert | undefined> {
@@ -410,7 +414,7 @@ export class DatabaseStorage implements IStorage {
       .orderBy(desc(sysSnapshots.ts))
       .limit(1);
 
-    const gpuSnapshots = await db
+    const gpuSnapshotData = await db
       .select()
       .from(gpuSnapshots)
       .where(eq(gpuSnapshots.serverId, serverId))
@@ -420,7 +424,7 @@ export class DatabaseStorage implements IStorage {
     return {
       server,
       sysSnapshot,
-      gpuSnapshots,
+      gpuSnapshots: gpuSnapshotData,
     };
   }
 }
