@@ -7,17 +7,18 @@ import bcrypt from "bcrypt";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
 import { storage } from "./storage";
-import { ingestPayloadSchema, insertUserSchema } from "@shared/schema";
+import { ingestPayloadSchema, registerUserSchema } from "@shared/schema";
 import { setupWebSocket } from "./websocket";
 import { checkAlerts } from "./alerting";
-import { authenticateApiKey, authenticateJWT, generateJWT } from "./auth";
+import { authenticateApiKey, authenticateJWT, generateJWT, requireRole } from "./auth";
 
 const JWT_SECRET = process.env.JWT_SECRET || "development-secret-key";
 
-// Rate limiting
+// Rate limiting - More permissive in development
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
+  max: process.env.NODE_ENV === "development" ? 1000 : 100, // Higher limit for dev
+  skip: (req) => process.env.NODE_ENV === "development" && req.path.startsWith("/api/auth"), // Skip auth endpoints in dev
 });
 
 const ingestLimiter = rateLimit({
@@ -26,6 +27,9 @@ const ingestLimiter = rateLimit({
 });
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  // Trust proxy for accurate rate limiting in hosted environments
+  app.set('trust proxy', 1);
+
   // CORS setup
   app.use(cors({
     origin: process.env.NODE_ENV === "production" 
@@ -71,13 +75,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(401).json({ message: "Invalid credentials" });
       }
 
-      const isValid = await bcrypt.compare(password, user.password);
+      const isValid = await bcrypt.compare(password, user.passwordHash);
       if (!isValid) {
         return res.status(401).json({ message: "Invalid credentials" });
       }
 
-      const token = generateJWT(user.id);
-      res.json({ token, user: { id: user.id, username: user.username } });
+      const token = generateJWT(user.id, user.role);
+      res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
     } catch (error) {
       console.error("Login error:", error);
       res.status(500).json({ message: "Internal server error" });
@@ -86,7 +90,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/auth/register", async (req, res) => {
     try {
-      const userData = insertUserSchema.parse(req.body);
+      const userData = registerUserSchema.parse(req.body);
       
       // Check if user already exists
       const existingUser = await storage.getUserByUsername(userData.username);
@@ -98,14 +102,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const hashedPassword = await bcrypt.hash(userData.password, 10);
       
       const user = await storage.createUser({
-        ...userData,
-        password: hashedPassword,
+        username: userData.username,
+        passwordHash: hashedPassword,
+        role: "viewer", // Default role for new registrations
       });
 
-      const token = generateJWT(user.id);
+      const token = generateJWT(user.id, user.role);
       res.status(201).json({ 
         token, 
-        user: { id: user.id, username: user.username } 
+        user: { id: user.id, username: user.username, role: user.role } 
       });
     } catch (error) {
       if (error instanceof z.ZodError) {
@@ -214,7 +219,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.patch("/api/alerts/:id/resolve", authenticateJWT, async (req, res) => {
+  app.patch("/api/alerts/:id/resolve", authenticateJWT, requireRole('admin'), async (req, res) => {
     try {
       await storage.resolveAlert(req.params.id);
       res.json({ status: "OK" });
@@ -234,7 +239,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post("/api/rules", authenticateJWT, async (req, res) => {
+  app.post("/api/rules", authenticateJWT, requireRole('admin'), async (req, res) => {
     try {
       const rule = await storage.createRule(req.body);
       res.status(201).json(rule);
@@ -244,7 +249,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.patch("/api/rules/:id", authenticateJWT, async (req, res) => {
+  app.patch("/api/rules/:id", authenticateJWT, requireRole('admin'), async (req, res) => {
     try {
       const rule = await storage.updateRule(req.params.id, req.body);
       res.json(rule);
@@ -254,7 +259,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.delete("/api/rules/:id", authenticateJWT, async (req, res) => {
+  app.delete("/api/rules/:id", authenticateJWT, requireRole('admin'), async (req, res) => {
     try {
       await storage.deleteRule(req.params.id);
       res.status(204).send();
@@ -274,7 +279,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.patch("/api/settings", authenticateJWT, async (req, res) => {
+  app.patch("/api/settings", authenticateJWT, requireRole('admin'), async (req, res) => {
     try {
       await storage.updateSettings(req.body);
       res.json({ status: "OK" });

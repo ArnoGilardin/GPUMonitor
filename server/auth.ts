@@ -6,10 +6,11 @@ const API_KEY = process.env.COLLECTOR_API_KEY || "collector-key-123";
 
 export interface AuthenticatedRequest extends Request {
   userId?: string;
+  userRole?: string;
 }
 
-export function generateJWT(userId: string): string {
-  return jwt.sign({ userId }, JWT_SECRET, { expiresIn: "7d" });
+export function generateJWT(userId: string, role: string): string {
+  return jwt.sign({ userId, role }, JWT_SECRET, { expiresIn: "7d" });
 }
 
 export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: NextFunction) {
@@ -21,12 +22,27 @@ export function authenticateJWT(req: AuthenticatedRequest, res: Response, next: 
   }
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
+    const decoded = jwt.verify(token, JWT_SECRET) as { userId: string; role: string };
     req.userId = decoded.userId;
+    req.userRole = decoded.role;
     next();
   } catch (error) {
     return res.status(403).json({ message: "Invalid or expired token" });
   }
+}
+
+export function requireRole(requiredRole: string) {
+  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+    if (!req.userRole) {
+      return res.status(403).json({ message: "User role not found in token" });
+    }
+    
+    if (req.userRole !== requiredRole) {
+      return res.status(403).json({ message: "Insufficient permissions" });
+    }
+    
+    next();
+  };
 }
 
 export function authenticateApiKey(req: Request, res: Response, next: NextFunction) {
