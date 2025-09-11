@@ -10,7 +10,7 @@ import { storage } from "./storage";
 import { ingestPayloadSchema, registerUserSchema } from "@shared/schema";
 import { setupWebSocket } from "./websocket.ts";
 import { checkAlerts } from "./alerting.ts";
-import { authenticateApiKey, authenticateJWT, generateJWT, requireRole } from "./auth.ts";
+import { authenticateApiKey, authenticateJWT, generateTokenPair, refreshAccessToken, revokeRefreshToken, requireRole } from "./auth.ts";
 
 const JWT_SECRET = process.env.JWT_SECRET || "development-secret-key";
 
@@ -80,8 +80,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(401).json({ message: "Invalid credentials" });
       }
 
-      const token = generateJWT(user.id, user.role);
-      res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+      const { accessToken, refreshToken } = generateTokenPair(user.id, user.role);
+      res.json({ 
+        token: accessToken,
+        refreshToken,
+        user: { id: user.id, username: user.username, role: user.role } 
+      });
     } catch (error) {
       console.error("Login error:", error);
       res.status(500).json({ message: "Internal server error" });
@@ -107,9 +111,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
         role: "viewer", // Default role for new registrations
       });
 
-      const token = generateJWT(user.id, user.role);
+      const { accessToken, refreshToken } = generateTokenPair(user.id, user.role);
       res.status(201).json({ 
-        token, 
+        token: accessToken,
+        refreshToken,
         user: { id: user.id, username: user.username, role: user.role } 
       });
     } catch (error) {
@@ -117,6 +122,52 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ message: "Invalid input", errors: error.errors });
       }
       console.error("Registration error:", error);
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // Refresh token endpoint
+  app.post("/api/auth/refresh", async (req, res) => {
+    try {
+      const { refreshToken } = req.body;
+      
+      if (!refreshToken) {
+        return res.status(400).json({ message: "Refresh token required" });
+      }
+
+      // Get user from refresh token to fetch current role
+      const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET || "development-refresh-secret") as { userId: string };
+      const user = await storage.getUser(decoded.userId);
+      
+      if (!user) {
+        return res.status(401).json({ message: "User not found" });
+      }
+
+      const newAccessToken = refreshAccessToken(refreshToken, user.role);
+      
+      if (!newAccessToken) {
+        return res.status(401).json({ message: "Invalid or expired refresh token" });
+      }
+
+      res.json({ token: newAccessToken });
+    } catch (error) {
+      console.error("Token refresh error:", error);
+      res.status(401).json({ message: "Invalid refresh token" });
+    }
+  });
+
+  // Logout endpoint
+  app.post("/api/auth/logout", async (req, res) => {
+    try {
+      const { refreshToken } = req.body;
+      
+      if (refreshToken) {
+        revokeRefreshToken(refreshToken);
+      }
+      
+      res.json({ message: "Logged out successfully" });
+    } catch (error) {
+      console.error("Logout error:", error);
       res.status(500).json({ message: "Internal server error" });
     }
   });
