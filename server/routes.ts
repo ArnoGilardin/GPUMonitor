@@ -343,7 +343,15 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.get("/api/stats", authenticateJWT, async (req, res) => {
     try {
       const stats = await storage.getStats();
-      res.json(stats);
+      const alerts = await storage.getAlerts();
+      const criticalAlerts = alerts.filter(alert => alert.severity === 'critical' && !alert.resolvedAt).length;
+      
+      // Ensure response matches UI expectations
+      res.json({
+        ...stats,
+        criticalAlerts,
+        totalPowerConsumption: stats.totalPowerKW || 0
+      });
     } catch (error) {
       console.error("Get stats error:", error);
       res.status(500).json({ message: "Internal server error" });
