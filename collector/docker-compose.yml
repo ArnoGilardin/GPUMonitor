@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  gpu-collector:
+    build: .
+    container_name: gpu-monitor-collector
+    restart: unless-stopped
+    environment:
+      - CENTRAL_API_URL=${CENTRAL_API_URL:-http://host.docker.internal:5000}
+      - CENTRAL_API_KEY=${CENTRAL_API_KEY:-collector-key-123}
+      - SERVER_ID=${SERVER_ID:-docker-collector}
+      - SERVER_NAME=${SERVER_NAME:-Docker Collector}
+      - SERVER_TAGS=${SERVER_TAGS:-docker,gpu}
+      - INTERVAL_SEC=${INTERVAL_SEC:-30}
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /dev:/host/dev:ro
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    network_mode: host
+    
+  # Alternative service without GPU access for CPU-only servers
+  cpu-collector:
+    build: .
+    container_name: gpu-monitor-collector-cpu
+    restart: unless-stopped
+    environment:
+      - CENTRAL_API_URL=${CENTRAL_API_URL:-http://host.docker.internal:5000}
+      - CENTRAL_API_KEY=${CENTRAL_API_KEY:-collector-key-123}
+      - SERVER_ID=${SERVER_ID:-docker-collector-cpu}
+      - SERVER_NAME=${SERVER_NAME:-Docker CPU Collector}
+      - SERVER_TAGS=${SERVER_TAGS:-docker,cpu-only}
+      - INTERVAL_SEC=${INTERVAL_SEC:-30}
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+    profiles:
+      - cpu-only

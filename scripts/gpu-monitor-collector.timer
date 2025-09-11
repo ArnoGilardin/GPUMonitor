@@ -1,0 +1,11 @@
+[Unit]
+Description=GPU Monitor Collector Timer
+Requires=gpu-monitor-collector.service
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
