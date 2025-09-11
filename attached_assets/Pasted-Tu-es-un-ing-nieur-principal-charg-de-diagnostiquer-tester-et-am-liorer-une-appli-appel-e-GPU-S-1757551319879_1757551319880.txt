@@ -1,0 +1,173 @@
+Tu es un ingénieur principal chargé de diagnostiquer, tester et améliorer une appli appelée “GPU & Server Monitor”.
+Objectifs : (1) corriger la connexion (admin/admin en démo), (2) ajouter des tests e2e/UI via App Testing, (3) durcir sécurité/UX, (4) livrer scripts & docs.
+Travaille en TypeScript côté API (Node/Express) et React + Vite + Tailwind côté front. DB : SQLite par défaut, option PostgreSQL via DATABASE_URL.
+
+1) Audit & correctifs AUTH
+
+Diagnostiquer la cause du “Invalid username or password” :
+
+Confirmer schéma Users : id, username UNIQUE, password_hash, role, createdAt.
+
+Vérifier hachage (bcrypt ou argon2) et comparaison.
+
+Vérifier seed (admin/admin) réellement inséré en dev.
+
+Confirmer lookup par username (case-insensitive) + timing-safe compare.
+
+Scripts de migration/seed :
+
+npm run db:migrate → crée tables.
+
+npm run db:seed → crée user admin avec mot de passe admin UNIQUEMENT en DEV (contrôlé par NODE_ENV=development + variable ALLOW_DEMO_SEED=true).
+
+Route de bootstrap admin (sécurisée) :
+
+POST /v1/admin/bootstrap active UNIQUEMENT si ALLOW_BOOTSTRAP_ADMIN=true et si aucun admin n’existe.
+
+Paramètres : username, password.
+
+Après création, mettre ALLOW_BOOTSTRAP_ADMIN=false dans la doc.
+
+JWT + refresh :
+
+POST /v1/auth/login → retourne accessToken (short TTL, ex. 15 min) + refreshToken (httpOnly, Secure, SameSite=Lax).
+
+POST /v1/auth/refresh → renouvelle accessToken.
+
+POST /v1/auth/logout → invalide refresh (table de tokens ou rotation).
+
+RBAC simple : rôles admin, viewer. Protéger routes admin (règles/alertes/paramètres).
+
+2) UX/Front Login
+
+Formulaire login :
+
+Indiquer Caps Lock détecté.
+
+Afficher / masquer mot de passe (déjà présent), + bouton “Use demo credentials” en dev qui pré-remplit admin/admin.
+
+Messages d’erreur clairs : “Utilisateur introuvable”, “Mot de passe incorrect”. Éviter de révéler trop de détails en prod (message générique).
+
+Lockout progressif (ex. 5 tentatives → délai 5 min) + rate limit IP/username côté API.
+
+Rappels : “Demo credentials: admin/admin (DEV only)”.
+
+3) Sécurité API
+
+Helmet, CORS (origines autorisées), rate limit (login & /v1/ingest), validation (Zod/Yup) sur toutes les entrées.
+
+Pas de secrets en dur. Fournir .env.example avec :
+
+NODE_ENV=development
+JWT_SECRET=change_me
+REFRESH_SECRET=change_me_too
+ALLOW_DEMO_SEED=true
+ALLOW_BOOTSTRAP_ADMIN=true
+DATABASE_URL= (optionnel pour Postgres)
+
+
+/health : retourne statut DB, uptime, version.
+
+4) Tests automatiques (App Testing + e2e)
+
+Plan App Testing (navigateur réel) :
+
+Ouvrir page /login.
+
+Tenter login faux → vérifier message d’erreur.
+
+Cliquer “Use demo credentials” → admin/admin (dev).
+
+Soumettre → accès au Dashboard (vérifier présence d’un texte « Welcome, admin » ou équivalent).
+
+Naviguer vers Settings → créer une rule gpu_temp > 80°C.
+
+Aller sur Servers → voir liste (vide au départ).
+
+Utiliser mock collector (script fourni) pour pousser 3 payloads → vérifier apparition du serveur et métriques live.
+
+Simuler valeurs >80°C 120s → vérifier alerte s’affiche.
+
+Déconnexion → retour login.
+
+Tests e2e (Playwright) :
+
+auth.spec.ts (login ok/ko, lockout, refresh).
+
+ingest.spec.ts (ingest refuse sans x-api-key, accepte avec clé).
+
+alerts.spec.ts (règle + tir déclenché par mock data).
+
+Unit tests (Jest) : hashing, JWT, services règles/alertes.
+
+5) Collector de démo (mock)
+
+Fournir un script Node/Python scripts/mock_collector.ts|py :
+
+Envoyer sur POST /v1/ingest avec header x-api-key: DEMO_KEY.
+
+Variables env du mock : CENTRAL_API_URL, SERVER_ID=z840, INTERVAL_SEC=5.
+
+1ère série : valeurs normales → vérifier dashboard.
+
+2ème série : pousser tempC > 80 pendant 120s → déclencher alerte.
+
+Fournir exemples curl dans README.
+
+6) Durcissement & Qualité
+
+Logs (pino/winston) + rotation. Masquer infos sensibles.
+
+Erreur 401/403 claires.
+
+Docker/Compose :
+
+Service api (port 8080), web (front), db (optionnel Postgres).
+
+Profiles dev et prod (+ NODE_ENV respecté).
+
+Makefile : make dev, make test, make build, make migrate, make seed.
+
+CI basique : lint + tests (fail si coverage < 70% sur modules critiques).
+
+7) Documentation
+
+README.md :
+
+Installation dev rapide (Node, pnpm/npm, SQLite).
+
+npm run db:migrate && npm run db:seed (dev).
+
+Connexion démo (admin/admin).
+
+Variables d’env (avec .env.example).
+
+Docker Compose (dev/prod) + reverse proxy note.
+
+Procédure bootstrap admin (et désactivation du flag ensuite).
+
+Sécurité : rate limit, lockout, JWT/refresh, RBAC.
+
+App Testing : comment relancer la suite e2e navigateur.
+
+CHANGELOG.md : lister corrections auth + tests ajoutés.
+
+CHECKPOINTS : créer un checkpoint après chaque étape verte.
+
+8) Critères d’acceptation (doit être VERT)
+
+Seed dev ok : connexion admin/admin fonctionne en DEV.
+
+En PROD, pas de seed démo et bootstrap disabled par défaut.
+
+App Testing passe toutes les étapes (login, rules, ingest mock, alert).
+
+Playwright/Jest verts, coverage ≥ 70% modules auth & règles.
+
+README clair, .env.example complet, Docker/Compose fonctionne.
+
+Aucun secret dans le dépôt.
+
+Checkpoints créés, dernier checkpoint = “Auth fixed + E2E passing”.
+
+Quand tu as fini, explique les changements (auth/seed/bootstrap, tests, sécurité) et fais un rollback possible au checkpoint N-1 si un test échoue, puis corrige et re-teste jusqu’au vert.
