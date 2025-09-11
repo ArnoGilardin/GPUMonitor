@@ -5,8 +5,8 @@ const JWT_SECRET = process.env.JWT_SECRET || "development-secret-key";
 const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || "development-refresh-secret";
 const API_KEY = process.env.COLLECTOR_API_KEY || "collector-key-123";
 
-// In-memory storage for refresh tokens (in production, use Redis or database)
-const refreshTokenStore = new Set<string>();
+// Database storage for refresh tokens (replacing in-memory storage)
+import { storage } from "./storage";
 
 export interface AuthenticatedRequest extends Request {
   userId?: string;
@@ -18,12 +18,20 @@ export interface TokenPair {
   refreshToken: string;
 }
 
-export function generateTokenPair(userId: string, role: string): TokenPair {
+export async function generateTokenPair(userId: string, role: string, deviceFingerprint?: string, ipAddress?: string, userAgent?: string): Promise<TokenPair> {
   const accessToken = jwt.sign({ userId, role }, JWT_SECRET, { expiresIn: "15m" });
   const refreshToken = jwt.sign({ userId, type: "refresh" }, REFRESH_TOKEN_SECRET, { expiresIn: "7d" });
   
-  // Store refresh token
-  refreshTokenStore.add(refreshToken);
+  // Store refresh token in database with security metadata
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+  await storage.storeRefreshToken({
+    token: refreshToken,
+    userId,
+    deviceFingerprint,
+    ipAddress,
+    userAgent,
+    expiresAt,
+  });
   
   return { accessToken, refreshToken };
 }
@@ -65,7 +73,7 @@ export function requireRole(requiredRole: string) {
   };
 }
 
-export function refreshAccessToken(refreshToken: string, userRole: string): string | null {
+export async function refreshAccessToken(refreshToken: string, userRole: string): Promise<string | null> {
   try {
     // Verify refresh token
     const decoded = jwt.verify(refreshToken, REFRESH_TOKEN_SECRET) as { 
@@ -73,9 +81,18 @@ export function refreshAccessToken(refreshToken: string, userRole: string): stri
       type: string; 
     };
     
-    if (decoded.type !== "refresh" || !refreshTokenStore.has(refreshToken)) {
+    if (decoded.type !== "refresh") {
       return null;
     }
+    
+    // Check if token exists in database and not expired
+    const storedToken = await storage.getRefreshToken(refreshToken);
+    if (!storedToken || storedToken.expiresAt < new Date()) {
+      return null;
+    }
+    
+    // Update last used timestamp
+    await storage.updateRefreshTokenLastUsed(refreshToken, new Date());
     
     // Generate new access token
     return jwt.sign({ userId: decoded.userId, role: userRole }, JWT_SECRET, { expiresIn: "15m" });
@@ -84,8 +101,8 @@ export function refreshAccessToken(refreshToken: string, userRole: string): stri
   }
 }
 
-export function revokeRefreshToken(refreshToken: string): void {
-  refreshTokenStore.delete(refreshToken);
+export async function revokeRefreshToken(refreshToken: string): Promise<void> {
+  await storage.revokeRefreshToken(refreshToken);
 }
 
 export function authenticateApiKey(req: Request, res: Response, next: NextFunction) {

@@ -74,6 +74,30 @@ export const users = pgTable("users", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
+// Security tables for hardened authentication
+export const refreshTokens = pgTable("refresh_tokens", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  token: text("token").notNull().unique(),
+  userId: varchar("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  deviceFingerprint: text("device_fingerprint"),
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+  expiresAt: timestamp("expires_at").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  lastUsedAt: timestamp("last_used_at"),
+});
+
+export const securityAuditLog = pgTable("security_audit_log", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  userId: varchar("user_id").references(() => users.id, { onDelete: "set null" }),
+  eventType: text("event_type").notNull(), // "login", "logout", "token_refresh", "failed_login", "role_change", "api_key_used"
+  severity: text("severity").notNull().default("info"), // "info", "warning", "critical"
+  ipAddress: text("ip_address"),
+  userAgent: text("user_agent"),
+  details: jsonb("details"), // Additional event-specific data
+  timestamp: timestamp("timestamp").defaultNow().notNull(),
+});
+
 // Relations
 export const serversRelations = relations(servers, ({ many }) => ({
   gpuSnapshots: many(gpuSnapshots),
@@ -132,6 +156,37 @@ export const insertAlertSchema = createInsertSchema(alerts).omit({
   firedAt: true,
 });
 
+// Security schema additions
+export const insertRefreshTokenSchema = createInsertSchema(refreshTokens).omit({
+  id: true,
+  createdAt: true,
+});
+
+export const insertSecurityAuditLogSchema = createInsertSchema(securityAuditLog).omit({
+  id: true,
+  timestamp: true,
+});
+
+// Security table relations
+export const refreshTokensRelations = relations(refreshTokens, ({ one }) => ({
+  user: one(users, {
+    fields: [refreshTokens.userId],
+    references: [users.id],
+  }),
+}));
+
+export const securityAuditLogRelations = relations(securityAuditLog, ({ one }) => ({
+  user: one(users, {
+    fields: [securityAuditLog.userId],
+    references: [users.id],
+  }),
+}));
+
+export const usersRelations = relations(users, ({ many }) => ({
+  refreshTokens: many(refreshTokens),
+  securityAuditLog: many(securityAuditLog),
+}));
+
 export const insertSettingSchema = createInsertSchema(settings).omit({
   updatedAt: true,
 });
@@ -162,6 +217,10 @@ export type Setting = typeof settings.$inferSelect;
 export type InsertSetting = z.infer<typeof insertSettingSchema>;
 export type User = typeof users.$inferSelect;
 export type InsertUser = z.infer<typeof insertUserSchema>;
+export type RefreshToken = typeof refreshTokens.$inferSelect;
+export type InsertRefreshToken = z.infer<typeof insertRefreshTokenSchema>;
+export type SecurityAuditLog = typeof securityAuditLog.$inferSelect;
+export type InsertSecurityAuditLog = z.infer<typeof insertSecurityAuditLogSchema>;
 
 // Ingest payload schema
 export const ingestPayloadSchema = z.object({

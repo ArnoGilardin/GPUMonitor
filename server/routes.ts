@@ -6,7 +6,9 @@ import jwt from "jsonwebtoken";
 import bcrypt from "bcrypt";
 import rateLimit from "express-rate-limit";
 import cors from "cors";
+import helmet from "helmet";
 import { storage } from "./storage";
+import { securityHeaders, authSlowDown, authRateLimit, collectorRateLimit, logSecurityEvent, generateDeviceFingerprint, sanitizeRequest } from "./middleware/security";
 import { ingestPayloadSchema, registerUserSchema } from "@shared/schema";
 import { setupWebSocket } from "./websocket.ts";
 import { checkAlerts } from "./alerting.ts";
@@ -30,6 +32,12 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Trust proxy for accurate rate limiting in hosted environments
   app.set('trust proxy', 1);
 
+  // Security headers
+  app.use(securityHeaders);
+
+  // Request sanitization
+  app.use(sanitizeRequest);
+
   // CORS setup
   app.use(cors({
     origin: process.env.NODE_ENV === "production" 
@@ -38,7 +46,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     credentials: true,
   }));
 
-  // Apply rate limiting
+  // Apply general rate limiting (replaced the less secure one)
   app.use(limiter);
 
   // Health check
@@ -61,8 +69,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Authentication routes
-  app.post("/api/auth/login", async (req, res) => {
+  // Authentication routes with enhanced security
+  app.post("/api/auth/login", authSlowDown, authRateLimit, async (req, res) => {
     try {
       const { username, password } = req.body;
       
@@ -72,15 +80,45 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const user = await storage.getUserByUsername(username);
       if (!user) {
+        // Log failed login attempt
+        await logSecurityEvent({
+          eventType: "failed_login",
+          severity: "warning",
+          ipAddress: req.ip,
+          userAgent: req.get("User-Agent"),
+          details: { username, reason: "user_not_found" },
+        });
         return res.status(401).json({ message: "Invalid credentials" });
       }
 
       const isValid = await bcrypt.compare(password, user.passwordHash);
       if (!isValid) {
+        // Log failed login attempt
+        await logSecurityEvent({
+          userId: user.id,
+          eventType: "failed_login",
+          severity: "warning",
+          ipAddress: req.ip,
+          userAgent: req.get("User-Agent"),
+          details: { username, reason: "invalid_password" },
+        });
         return res.status(401).json({ message: "Invalid credentials" });
       }
 
-      const { accessToken, refreshToken } = generateTokenPair(user.id, user.role);
+      // Generate device fingerprint for security tracking
+      const deviceFingerprint = generateDeviceFingerprint(req);
+      const { accessToken, refreshToken } = await generateTokenPair(user.id, user.role, deviceFingerprint, req.ip, req.get("User-Agent"));
+      
+      // Log successful login
+      await logSecurityEvent({
+        userId: user.id,
+        eventType: "login",
+        severity: "info",
+        ipAddress: req.ip,
+        userAgent: req.get("User-Agent"),
+        details: { username, deviceFingerprint },
+      });
+
       res.json({ 
         token: accessToken,
         refreshToken,
@@ -111,7 +149,20 @@ export async function registerRoutes(app: Express): Promise<Server> {
         role: "viewer", // Default role for new registrations
       });
 
-      const { accessToken, refreshToken } = generateTokenPair(user.id, user.role);
+      // Generate device fingerprint for security tracking
+      const deviceFingerprint = generateDeviceFingerprint(req);
+      const { accessToken, refreshToken } = await generateTokenPair(user.id, user.role, deviceFingerprint, req.ip, req.get("User-Agent"));
+      
+      // Log successful registration
+      await logSecurityEvent({
+        userId: user.id,
+        eventType: "register",
+        severity: "info",
+        ipAddress: req.ip,
+        userAgent: req.get("User-Agent"),
+        details: { username: userData.username, deviceFingerprint },
+      });
+      
       res.status(201).json({ 
         token: accessToken,
         refreshToken,
@@ -143,11 +194,29 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(401).json({ message: "User not found" });
       }
 
-      const newAccessToken = refreshAccessToken(refreshToken, user.role);
+      const newAccessToken = await refreshAccessToken(refreshToken, user.role);
       
       if (!newAccessToken) {
+        // Log failed refresh attempt
+        await logSecurityEvent({
+          userId: user.id,
+          eventType: "token_refresh_failed",
+          severity: "warning",
+          ipAddress: req.ip,
+          userAgent: req.get("User-Agent"),
+          details: { reason: "invalid_or_expired_token" },
+        });
         return res.status(401).json({ message: "Invalid or expired refresh token" });
       }
+
+      // Log successful token refresh
+      await logSecurityEvent({
+        userId: user.id,
+        eventType: "token_refresh",
+        severity: "info",
+        ipAddress: req.ip,
+        userAgent: req.get("User-Agent"),
+      });
 
       res.json({ token: newAccessToken });
     } catch (error) {
@@ -156,13 +225,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Logout endpoint
+  // Logout endpoint  
   app.post("/api/auth/logout", async (req, res) => {
     try {
       const { refreshToken } = req.body;
       
       if (refreshToken) {
-        revokeRefreshToken(refreshToken);
+        // Get user info before revoking token for audit logging
+        try {
+          const decoded = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET || "development-refresh-secret") as { userId: string };
+          
+          await revokeRefreshToken(refreshToken);
+          
+          // Log successful logout
+          await logSecurityEvent({
+            userId: decoded.userId,
+            eventType: "logout",
+            severity: "info",
+            ipAddress: req.ip,
+            userAgent: req.get("User-Agent"),
+          });
+        } catch (jwtError) {
+          // Token already invalid, just log the attempt
+          await logSecurityEvent({
+            eventType: "logout",
+            severity: "info", 
+            ipAddress: req.ip,
+            userAgent: req.get("User-Agent"),
+            details: { invalidToken: true },
+          });
+        }
       }
       
       res.json({ message: "Logged out successfully" });
@@ -173,7 +265,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Data ingestion endpoint (for collectors)
-  app.post("/v1/ingest", ingestLimiter, authenticateApiKey, async (req, res) => {
+  app.post("/v1/ingest", collectorRateLimit, authenticateApiKey, async (req, res) => {
     try {
       const payload = ingestPayloadSchema.parse(req.body);
       

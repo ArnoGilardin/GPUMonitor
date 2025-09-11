@@ -6,6 +6,8 @@ import {
   rules, 
   settings, 
   users,
+  refreshTokens,
+  securityAuditLog,
   type Server, 
   type InsertServer,
   type GpuSnapshot,
@@ -19,7 +21,11 @@ import {
   type Setting,
   type InsertSetting,
   type User, 
-  type InsertUser 
+  type InsertUser,
+  type RefreshToken,
+  type InsertRefreshToken,
+  type SecurityAuditLog,
+  type InsertSecurityAuditLog
 } from "@shared/schema";
 import { db } from "./db";
 import { eq, desc, and, gte, isNull, sql } from "drizzle-orm";
@@ -59,6 +65,15 @@ export interface IStorage {
   // Stats and monitoring
   getStats(): Promise<any>;
   getLatestMetrics(serverId: string): Promise<any>;
+
+  // Security features
+  storeRefreshToken(token: InsertRefreshToken): Promise<RefreshToken>;
+  getRefreshToken(token: string): Promise<RefreshToken | undefined>;
+  revokeRefreshToken(token: string): Promise<void>;
+  cleanupExpiredTokens(): Promise<void>;
+  updateRefreshTokenLastUsed(token: string, lastUsedAt: Date): Promise<void>;
+  logSecurityEvent(event: InsertSecurityAuditLog): Promise<SecurityAuditLog>;
+  getSecurityAuditLog(limit?: number): Promise<SecurityAuditLog[]>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -426,6 +441,41 @@ export class DatabaseStorage implements IStorage {
       sysSnapshot,
       gpuSnapshots: gpuSnapshotData,
     };
+  }
+  // Security features implementation
+  async storeRefreshToken(tokenData: InsertRefreshToken): Promise<RefreshToken> {
+    const [token] = await db.insert(refreshTokens).values(tokenData).returning();
+    return token;
+  }
+
+  async getRefreshToken(token: string): Promise<RefreshToken | undefined> {
+    const [refreshToken] = await db.select().from(refreshTokens).where(eq(refreshTokens.token, token));
+    return refreshToken || undefined;
+  }
+
+  async revokeRefreshToken(token: string): Promise<void> {
+    await db.delete(refreshTokens).where(eq(refreshTokens.token, token));
+  }
+
+  async cleanupExpiredTokens(): Promise<void> {
+    await db.delete(refreshTokens).where(sql`expires_at < NOW()`);
+  }
+
+  async updateRefreshTokenLastUsed(token: string, lastUsedAt: Date): Promise<void> {
+    await db.update(refreshTokens)
+      .set({ lastUsedAt })
+      .where(eq(refreshTokens.token, token));
+  }
+
+  async logSecurityEvent(eventData: InsertSecurityAuditLog): Promise<SecurityAuditLog> {
+    const [event] = await db.insert(securityAuditLog).values(eventData).returning();
+    return event;
+  }
+
+  async getSecurityAuditLog(limit: number = 100): Promise<SecurityAuditLog[]> {
+    return await db.select().from(securityAuditLog)
+      .orderBy(desc(securityAuditLog.timestamp))
+      .limit(limit);
   }
 }
 
