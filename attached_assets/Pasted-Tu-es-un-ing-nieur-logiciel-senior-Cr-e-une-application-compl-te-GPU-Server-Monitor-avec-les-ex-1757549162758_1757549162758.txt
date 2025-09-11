@@ -1,0 +1,154 @@
+Tu es un ingénieur logiciel senior. Crée une application complète “GPU & Server Monitor” avec les exigences suivantes. Construis-la end-to-end, puis lance App Testing pour valider l’UI et les APIs.
+
+Objectif
+
+Surveiller plusieurs serveurs Linux (Ubuntu) et leurs GPU (NVIDIA/AMD) depuis un tableau de bord web central :
+
+Métriques système : CPU %, RAM %, Disque %, Uptime, Load.
+
+Métriques GPU : utilisation %, VRAM utilisée/total, température, puissance, ventilateur, liste des GPUs, pilotes.
+
+Alertes : seuils configurables → notifications (email + webhook générique pour Telegram/Slack).
+
+Architecture
+
+Frontend : React + Vite + Tailwind, routing (Dashboard, Détails Serveur, Alertes, Paramètres). UI moderne (responsive), graphiques temps réel (WebSocket/EventSource).
+
+Backend API : Node.js + Express (TypeScript).
+
+Endpoints REST + WebSocket/SSE.
+
+Auth par API key (header x-api-key) pour collectors et admin JWT pour l’UI.
+
+Rate limiting basique et CORS correct.
+
+SQLite par défaut (fichier) + option PostgreSQL via DATABASE_URL.
+
+Migrations (Drizzle ou Prisma) + seeding minimal.
+
+Collector léger (agent côté serveur) : petit service Python (ou Node) qui :
+
+Lit métriques toutes les 10–30 s et push vers l’API centrale (/v1/ingest).
+
+NVIDIA : nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw,fan.speed --format=csv,noheader,nounits + NVML si dispo.
+
+AMD : rocm-smi --showuse --showtemp --showfan --showpower --csv (si présent).
+
+Système : psutil (CPU %, RAM %, disque, uptime, load avg).
+
+Config via variables d’env : CENTRAL_API_URL, CENTRAL_API_KEY, SERVER_ID, INTERVAL_SEC.
+
+Fournis Dockerfile + docker-compose.yml pour le collector, et alternative systemd (service + timer).
+
+Sécurité & contraintes
+
+Aucune action destructive. Le collector est lecture seule (commandes d’info uniquement).
+
+API centrale HTTPS-ready (prévoir reverse proxy), support TRUST_PROXY.
+
+Ne stocke jamais de secrets en clair dans le code : utiliser .env.example, lire depuis l’env.
+
+Modèle de données (schémas)
+
+servers: id (string), name, tags[], ip, lastSeenAt, createdAt.
+
+gpu_snapshots: id, serverId, gpuIndex, vendor ("nvidia" | "amd"), utilPercent, vramUsedMB, vramTotalMB, tempC, powerW, fanPercent, driverVersion, ts.
+
+sys_snapshots: id, serverId, cpuPercent, ramPercent, diskPercent, load1, uptimeSec, ts.
+
+alerts: id, serverId, ruleId, level ("warning"|"critical"), message, firedAt, resolvedAt.
+
+rules: id, name, type ("gpu_temp"|"gpu_util"|"vram_util"|"cpu_util"|"disk_util"), threshold, durationSec, level, enabled.
+
+settings: clés (alert_email_to, webhook_url, etc.).
+
+Endpoints (exemples)
+
+POST /v1/ingest (collector → central)
+Body JSON :
+
+{
+  "server": {"id":"z840","name":"HP Z840","tags":["GED","AI"]},
+  "sys": {"cpuPercent": 72.5, "ramPercent": 64.2, "diskPercent": 81.1, "load1": 2.4, "uptimeSec": 123456},
+  "gpus": [
+    {"gpuIndex":0,"vendor":"nvidia","utilPercent":65,"vramUsedMB":6200,"vramTotalMB":8192,"tempC":76,"powerW":145,"fanPercent":62,"driverVersion":"535.183"}
+  ],
+  "ts": "ISO8601"
+}
+
+
+GET /v1/servers → liste & lastSeenAt
+
+GET /v1/servers/:id → info + dernières métriques (join sur snapshots)
+
+GET /v1/servers/:id/stream → SSE pour métriques live (10 s)
+
+GET /v1/alerts / POST /v1/rules / PATCH /v1/rules/:id
+
+GET /health (inclure db, queue, uptime)
+
+Frontend (pages & UX)
+
+Dashboard : cartes par serveur (couleur par état : OK, Warning, Critique), mini-sparklines (util GPU/CPU sur 15 min), tri/filtre par tag.
+
+Détails serveur : graphiques (util GPU, VRAM, température, CPU, RAM, Disque), liste des GPUs, dernier driverVersion, statut last seen. Bouton “copier commande Docker collector”.
+
+Alertes : table, filtre par serveur/règle/état, bouton “Marquer résolu”.
+
+Paramètres : email destinataire, webhook URL, configuration de seuils par défaut, rotation des logs. Import/Export JSON des règles.
+
+Navbar avec recherche par serverId/name.
+
+Alerting
+
+Évalue les règles côté backend de façon périodique (cron 30 s).
+
+En cas de déclenchement, persist alerte + envoie email (SMTP via env) et webhook POST générique (payload JSON).
+
+Déploiement
+
+Fournis Docker Compose pour :
+
+central (API + UI dans le même repo), port 8080
+
+db (Postgres optionnel)
+
+Fournis un compose collector à part (facile à copier) et un script shell install_collector.sh pour Ubuntu (installe Docker s’il n’est pas là, crée .env, lance compose).
+
+Ajoute un Makefile avec cibles dev, build, compose-up, migrate, seed.
+
+Génère .env.example (clés : API_KEY_ADMIN, COLLECTOR_API_KEY, JWT_SECRET, SMTP_*, WEBHOOK_URL, DATABASE_URL).
+
+Tests & validation (à exécuter via App Testing)
+
+Démarrage dev → GET /health renvoie OK, affiche l’UI.
+
+Simule un collector local (script Node/Python mock) qui envoie 3 payloads → le Dashboard liste le serveur “local” et voit les métriques évoluer.
+
+SSE/WS : le graphe du serveur se met à jour sans refresh.
+
+Crée une règle gpu_temp > 80°C / 120s → injecte des données simulées >80°C pendant 2 min → l’alerte apparaît et un appel webhook est loggué.
+
+Sécurité :
+
+/v1/ingest sans x-api-key → 401
+
+/v1/servers sans JWT → 401
+
+Checkpoints : après chaque étape verte, crée un checkpoint. Si un test UI échoue, corrige et re-teste jusqu’au vert.
+
+Livrables attendus
+
+Code complet (frontend + backend + collector).
+
+README.md clair : installation, variables, Docker, commandes collector, exemples curl.
+
+docker-compose.yml (central) + collector/docker-compose.yml.
+
+scripts/install_collector.sh + service systemd alternatif (gpu-monitor-collector.service + gpu-monitor-collector.timer).
+
+Exemple de payload et postman collection (ou .http files).
+
+CI basique (lint, build).
+
+Aucun secret en dur. Pas d’actions destructives (read-only).
