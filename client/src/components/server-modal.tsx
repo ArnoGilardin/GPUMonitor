@@ -9,6 +9,31 @@ import { useWebSocket } from "@/hooks/use-websocket";
 import { useToast } from "@/hooks/use-toast";
 import { cn } from "@/lib/utils";
 import MetricChart from "@/components/charts/metric-chart";
+import type { Server } from "@shared/schema";
+
+// Types for server modal data
+interface ServerDetails extends Server {
+  status: "online" | "offline" | "warning" | "error";
+  cpuPercent?: number;
+  ramPercent?: number;
+  gpuUtil?: number;
+  gpus?: Array<{
+    id: string;
+    name: string;
+    tempC: number;
+    powerW: number;
+    util: number;
+  }>;
+}
+
+type ServerMetrics = Array<{
+  time: string;
+  gpu: number;
+  cpu: number;
+  ram: number;
+  temp: number;
+  power: number;
+}>;
 
 interface ServerModalProps {
   serverId: string | null;
@@ -19,12 +44,12 @@ interface ServerModalProps {
 export default function ServerModal({ serverId, isOpen, onClose }: ServerModalProps) {
   const { toast } = useToast();
 
-  const { data: server } = useQuery({
+  const { data: server } = useQuery<ServerDetails>({
     queryKey: ["/api/servers", serverId],
     enabled: !!serverId && isOpen,
   });
 
-  const { data: metrics } = useQuery({
+  const { data: metrics = [] } = useQuery<ServerMetrics>({
     queryKey: ["/api/servers", serverId, "metrics"],
     enabled: !!serverId && isOpen,
     refetchInterval: 30000,
@@ -132,7 +157,7 @@ export default function ServerModal({ serverId, isOpen, onClose }: ServerModalPr
               </CardHeader>
               <CardContent>
                 <MetricChart
-                  data={mockChartData}
+                  data={metrics}
                   dataKey="gpu"
                   color="hsl(var(--chart-1))"
                   type="area"
@@ -149,7 +174,7 @@ export default function ServerModal({ serverId, isOpen, onClose }: ServerModalPr
               </CardHeader>
               <CardContent>
                 <MetricChart
-                  data={mockChartData}
+                  data={metrics}
                   dataKey="cpu"
                   color="hsl(var(--chart-2))"
                   domain={[0, 100]}
@@ -168,7 +193,7 @@ export default function ServerModal({ serverId, isOpen, onClose }: ServerModalPr
               </CardHeader>
               <CardContent>
                 <MetricChart
-                  data={mockChartData}
+                  data={metrics}
                   dataKey="temp"
                   color="hsl(var(--warning))"
                   domain={[40, 90]}
@@ -187,7 +212,7 @@ export default function ServerModal({ serverId, isOpen, onClose }: ServerModalPr
               </CardHeader>
               <CardContent>
                 <MetricChart
-                  data={mockChartData}
+                  data={metrics}
                   dataKey="power"
                   color="hsl(var(--chart-4))"
                   type="area"

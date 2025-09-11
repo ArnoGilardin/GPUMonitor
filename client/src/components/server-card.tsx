@@ -139,9 +139,9 @@ export default function ServerCard({ server, onClick }: ServerCardProps) {
               </div>
               <Progress 
                 value={server.cpuPercent} 
-                className="h-2"
-                indicatorClassName={cn(
-                  server.cpuPercent > 80 ? "bg-warning" : "bg-chart-1"
+                className={cn(
+                  "h-2",
+                  server.cpuPercent > 80 ? "[&>div]:bg-warning" : "[&>div]:bg-chart-1"
                 )}
               />
             </div>
@@ -154,9 +154,9 @@ export default function ServerCard({ server, onClick }: ServerCardProps) {
               </div>
               <Progress 
                 value={server.ramPercent} 
-                className="h-2"
-                indicatorClassName={cn(
-                  server.ramPercent > 85 ? "bg-warning" : "bg-chart-2"
+                className={cn(
+                  "h-2",
+                  server.ramPercent > 85 ? "[&>div]:bg-warning" : "[&>div]:bg-chart-2"
                 )}
               />
             </div>

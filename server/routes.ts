@@ -8,9 +8,9 @@ import rateLimit from "express-rate-limit";
 import cors from "cors";
 import { storage } from "./storage";
 import { ingestPayloadSchema, registerUserSchema } from "@shared/schema";
-import { setupWebSocket } from "./websocket";
-import { checkAlerts } from "./alerting";
-import { authenticateApiKey, authenticateJWT, generateJWT, requireRole } from "./auth";
+import { setupWebSocket } from "./websocket.ts";
+import { checkAlerts } from "./alerting.ts";
+import { authenticateApiKey, authenticateJWT, generateJWT, requireRole } from "./auth.ts";
 
 const JWT_SECRET = process.env.JWT_SECRET || "development-secret-key";
 

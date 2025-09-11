@@ -10,6 +10,30 @@ import ServerModal from "@/components/server-modal";
 import AlertItem from "@/components/alert-item";
 import { useWebSocket } from "@/hooks/use-websocket";
 import { useToast } from "@/hooks/use-toast";
+import type { Server, Alert } from "@shared/schema";
+
+// Extended types for dashboard data
+interface DashboardServer extends Omit<Server, 'id' | 'createdAt'> {
+  id: string;
+  status: "online" | "offline" | "warning" | "error";
+  cpuPercent?: number;
+  ramPercent?: number;
+  gpuUtil?: number;
+  lastSeenAt?: Date | null;
+  gpus?: Array<{
+    name: string;
+    tempC: number;
+    powerW: number;
+  }>;
+}
+
+interface DashboardStats {
+  totalServers: string | number;
+  onlineServers: string | number;
+  totalGpus: string | number;
+  avgGpuUtil: string | number;
+  totalPowerKW: string | number;
+}
 
 export default function Dashboard() {
   const [filter, setFilter] = useState("all");
@@ -17,17 +41,17 @@ export default function Dashboard() {
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
   const { toast } = useToast();
 
-  const { data: servers = [], refetch: refetchServers } = useQuery({
+  const { data: servers = [], refetch: refetchServers } = useQuery<DashboardServer[]>({
     queryKey: ["/api/servers"],
     refetchInterval: 30000,
   });
 
-  const { data: stats = {} } = useQuery({
+  const { data: stats = {} as DashboardStats } = useQuery<DashboardStats>({
     queryKey: ["/api/stats"],
     refetchInterval: 30000,
   });
 
-  const { data: alerts = [] } = useQuery({
+  const { data: alerts = [] } = useQuery<Alert[]>({
     queryKey: ["/api/alerts"],
     refetchInterval: 10000,
   });
@@ -44,12 +68,12 @@ export default function Dashboard() {
     },
   });
 
-  const filteredServers = servers.filter((server: any) => {
+  const filteredServers = servers.filter((server) => {
     if (filter === "all") return true;
     return server.status === filter;
   });
 
-  const sortedServers = [...filteredServers].sort((a: any, b: any) => {
+  const sortedServers = [...filteredServers].sort((a, b) => {
     switch (sortBy) {
       case "name":
         return a.name.localeCompare(b.name);
@@ -62,7 +86,7 @@ export default function Dashboard() {
     }
   });
 
-  const activeAlerts = alerts.filter((alert: any) => !alert.resolvedAt);
+  const activeAlerts = alerts.filter((alert) => !alert.resolvedAt);
   const recentAlerts = alerts.slice(0, 3);
 
   const handleRefresh = async () => {

@@ -3,8 +3,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 interface MetricChartProps {
   data: Array<{
     time: string;
-    value: number;
-    [key: string]: any;
+    [key: string]: number | string;
   }>;
   dataKey: string;
   color: string;

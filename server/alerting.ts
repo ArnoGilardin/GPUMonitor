@@ -1,5 +1,5 @@
 import { storage } from "./storage";
-import { sendEmail } from "./sendgrid";
+import { sendEmail } from "./sendgrid.ts";
 
 interface AlertCheck {
   ruleId: string;
