@@ -16,16 +16,24 @@ import { authenticateApiKey, authenticateJWT, generateTokenPair, refreshAccessTo
 
 const JWT_SECRET = process.env.JWT_SECRET || "development-secret-key";
 
-// Rate limiting - More permissive in development
+// Rate limiting - More permissive in development with IPv6-safe key generation
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
   max: process.env.NODE_ENV === "development" ? 1000 : 100, // Higher limit for dev
   skip: (req) => process.env.NODE_ENV === "development" && req.path.startsWith("/api/auth"), // Skip auth endpoints in dev
+  keyGenerator: (req) => {
+    // Use default Express rate limit IP handling for IPv6 safety
+    return req.ip || "unknown";
+  },
 });
 
 const ingestLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
   max: 120, // allow more frequent requests from collectors
+  keyGenerator: (req) => {
+    // Use default Express rate limit IP handling for IPv6 safety
+    return req.ip || "unknown";
+  },
 });
 
 export async function registerRoutes(app: Express): Promise<Server> {

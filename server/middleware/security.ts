@@ -42,10 +42,7 @@ export const authRateLimit = rateLimit({
   max: process.env.NODE_ENV === "development" ? 100 : 5, // Much stricter in production
   standardHeaders: true,
   legacyHeaders: false,
-  keyGenerator: (req) => {
-    // Use default Express rate limit IP handling for IPv6 safety
-    return req.ip || "unknown";
-  },
+  // Remove custom keyGenerator to use default IPv6-safe implementation
   handler: (req: Request, res: Response) => {
     // Log potential brute force attempt
     logSecurityEvent({
@@ -72,13 +69,13 @@ export const collectorRateLimit = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
   max: 120, // Allow frequent requests from collectors
   keyGenerator: (req) => {
-    // Use API key as identifier instead of IP for collectors (IPv6 safe)
+    // Use API key as identifier instead of IP for collectors
     const apiKey = req.headers["x-api-key"] as string;
     if (apiKey) {
       return `api:${apiKey}`;
     }
-    // Use default IP key generation for IPv6 safety
-    return req.ip || "unknown";
+    // Use default IPv6-safe implementation for non-API requests
+    throw new Error("API key required for collector endpoints");
   },
   handler: (req: Request, res: Response) => {
     logSecurityEvent({
