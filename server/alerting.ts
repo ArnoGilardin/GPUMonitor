@@ -81,29 +81,38 @@ export async function checkAlerts(serverId: string) {
       }
     }
 
-    // Check if alerts should be fired (considering duration)
+    // Process alerts atomically to prevent duplicates
     for (const check of alertChecks) {
-      const existingAlert = await storage.getActiveAlert(serverId, check.ruleId);
-      
-      if (!existingAlert) {
-        // Check if the condition has been true for the required duration
-        const rule = rules.find(r => r.id === check.ruleId);
-        if (rule) {
-          const shouldFire = await storage.checkAlertDuration(serverId, check.ruleId, rule.durationSec);
-          
-          if (shouldFire) {
-            // Fire alert
-            await storage.createAlert({
-              serverId,
-              ruleId: check.ruleId,
-              level: check.level,
-              message: check.message,
-            });
+      try {
+        const existingAlert = await storage.getActiveAlert(serverId, check.ruleId);
+        
+        if (!existingAlert) {
+          // Check if the condition has been true for the required duration
+          const rule = rules.find(r => r.id === check.ruleId);
+          if (rule) {
+            const shouldFire = await storage.checkAlertDuration(serverId, check.ruleId, rule.durationSec);
+            
+            if (shouldFire) {
+              // Fire alert (atomic operation)
+              const newAlert = await storage.createAlert({
+                serverId,
+                ruleId: check.ruleId,
+                level: check.level,
+                message: check.message,
+              });
 
-            // Send notifications
-            await sendNotifications(check, latestMetrics.server.name);
+              // Send notifications (non-blocking, catch errors)
+              sendNotifications(check, latestMetrics.server.name)
+                .catch(err => {
+                  console.error(`Failed to send notifications for alert ${newAlert.id}:`, err);
+                  // Log to audit trail or metrics system
+                });
+            }
           }
         }
+      } catch (alertError) {
+        console.error(`Failed to process alert for rule ${check.ruleId}:`, alertError);
+        // Continue processing other alerts
       }
     }
   } catch (error) {
@@ -112,6 +121,8 @@ export async function checkAlerts(serverId: string) {
 }
 
 async function sendNotifications(alert: AlertCheck, serverName: string) {
+  const errors: string[] = [];
+  
   try {
     const settings = await storage.getSettings();
     const emailTo = settings.find(s => s.key === "alert_email_to")?.value;
@@ -119,43 +130,74 @@ async function sendNotifications(alert: AlertCheck, serverName: string) {
 
     // Send email notification
     if (emailTo && process.env.SENDGRID_API_KEY) {
-      const subject = `${alert.level.toUpperCase()} Alert: ${serverName}`;
-      const html = `
-        <h2>Server Monitor Alert</h2>
-        <p><strong>Server:</strong> ${serverName}</p>
-        <p><strong>Level:</strong> ${alert.level.toUpperCase()}</p>
-        <p><strong>Message:</strong> ${alert.message}</p>
-        <p><strong>Threshold:</strong> ${alert.threshold}</p>
-        <p><strong>Current Value:</strong> ${alert.value}</p>
-        <p><strong>Time:</strong> ${new Date().toISOString()}</p>
-      `;
+      try {
+        const subject = `${alert.level.toUpperCase()} Alert: ${serverName}`;
+        const html = `
+          <h2>Server Monitor Alert</h2>
+          <p><strong>Server:</strong> ${serverName}</p>
+          <p><strong>Level:</strong> ${alert.level.toUpperCase()}</p>
+          <p><strong>Message:</strong> ${alert.message}</p>
+          <p><strong>Threshold:</strong> ${alert.threshold}</p>
+          <p><strong>Current Value:</strong> ${alert.value}</p>
+          <p><strong>Time:</strong> ${new Date().toISOString()}</p>
+        `;
 
-      await sendEmail(process.env.SENDGRID_API_KEY, {
-        to: emailTo,
-        from: process.env.SENDGRID_FROM_EMAIL || "alerts@gpu-monitor.com",
-        subject,
-        html,
-      });
+        const emailSent = await sendEmail(process.env.SENDGRID_API_KEY, {
+          to: emailTo,
+          from: process.env.SENDGRID_FROM_EMAIL || "alerts@gpu-monitor.com",
+          subject,
+          html,
+        });
+        
+        if (!emailSent) {
+          errors.push(`Email notification failed for ${emailTo}`);
+        } else {
+          console.log(`✅ Alert email sent to ${emailTo}`);
+        }
+      } catch (emailError) {
+        const errorMsg = `Email notification error: ${emailError}`;
+        errors.push(errorMsg);
+        console.error(errorMsg);
+      }
     }
 
     // Send webhook notification
     if (webhookUrl) {
-      await fetch(webhookUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          server: serverName,
-          level: alert.level,
-          message: alert.message,
-          threshold: alert.threshold,
-          value: alert.value,
-          timestamp: new Date().toISOString(),
-        }),
-      });
+      try {
+        const response = await fetch(webhookUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            server: serverName,
+            level: alert.level,
+            message: alert.message,
+            threshold: alert.threshold,
+            value: alert.value,
+            timestamp: new Date().toISOString(),
+          }),
+        });
+        
+        if (!response.ok) {
+          errors.push(`Webhook notification failed with status ${response.status}`);
+        } else {
+          console.log(`✅ Alert webhook sent to ${webhookUrl}`);
+        }
+      } catch (webhookError) {
+        const errorMsg = `Webhook notification error: ${webhookError}`;
+        errors.push(errorMsg);
+        console.error(errorMsg);
+      }
+    }
+    
+    // Log any errors that occurred
+    if (errors.length > 0) {
+      console.error(`⚠️ Notification errors for ${serverName}:`, errors);
+      throw new Error(errors.join("; "));
     }
   } catch (error) {
     console.error("Notification sending error:", error);
+    throw error; // Re-throw to be caught by caller
   }
 }

@@ -66,13 +66,27 @@ export function setupWebSocket(server: Server) {
     ws.send(JSON.stringify({ type: "connected", timestamp: new Date().toISOString() }));
   });
 
-  // Broadcast updates to connected clients
-  setInterval(async () => {
-    if (wss.clients.size === 0) return;
+  // Broadcast updates to connected clients with throttling
+  let lastBroadcastData: any = null;
+  let broadcastTimer: NodeJS.Timeout;
+  
+  const broadcastUpdates = async () => {
+    // Skip if no clients connected
+    if (wss.clients.size === 0) {
+      return;
+    }
 
     try {
       const servers = await storage.getServersWithMetrics();
       const stats = await storage.getStats();
+
+      // Cache data to avoid duplicate DB queries
+      const currentData = JSON.stringify({ servers, stats });
+      if (currentData === lastBroadcastData) {
+        return; // No changes, skip broadcast
+      }
+      
+      lastBroadcastData = currentData;
 
       wss.clients.forEach((client: AuthenticatedWebSocket) => {
         if (client.readyState === WebSocket.OPEN) {
@@ -80,8 +94,8 @@ export function setupWebSocket(server: Server) {
             type: "update",
             timestamp: new Date().toISOString(),
             data: {
-              servers: client.serverId ? 
-                servers.filter(s => s.id === client.serverId) : 
+              servers: client.serverId ?
+                servers.filter(s => s.id === client.serverId) :
                 servers,
               stats,
             }
@@ -93,7 +107,17 @@ export function setupWebSocket(server: Server) {
     } catch (error) {
       console.error("WebSocket broadcast error:", error);
     }
-  }, 10000); // Broadcast every 10 seconds
+  };
+  
+  // Broadcast every 10 seconds
+  broadcastTimer = setInterval(broadcastUpdates, 10000);
+  
+  // Cleanup on server shutdown
+  wss.on('close', () => {
+    if (broadcastTimer) {
+      clearInterval(broadcastTimer);
+    }
+  });
 
   return wss;
 }

@@ -12,13 +12,16 @@ interface UseWebSocketOptions {
   onMessage?: (message: WebSocketMessage) => void;
   onError?: (error: Event) => void;
   reconnectInterval?: number;
+  maxReconnectAttempts?: number;
 }
 
 export function useWebSocket(options: UseWebSocketOptions = {}) {
   const { token } = useAuth();
-  const { serverId, onMessage, onError, reconnectInterval = 5000 } = options;
+  const { serverId, onMessage, onError, reconnectInterval = 5000, maxReconnectAttempts = 10 } = options;
   const ws = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
+  const reconnectAttempts = useRef<number>(0);
+  const currentDelay = useRef<number>(reconnectInterval);
 
   const connect = useCallback(() => {
     if (!token) return;
@@ -32,6 +35,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       ws.current.onopen = () => {
         console.log("WebSocket connected");
+        // Reset reconnection state on successful connection
+        reconnectAttempts.current = 0;
+        currentDelay.current = reconnectInterval;
         if (reconnectTimeoutRef.current) {
           clearTimeout(reconnectTimeoutRef.current);
           reconnectTimeoutRef.current = undefined;
@@ -51,9 +57,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         console.log("WebSocket disconnected");
         ws.current = null;
         
-        // Attempt to reconnect
-        if (!reconnectTimeoutRef.current) {
-          reconnectTimeoutRef.current = setTimeout(connect, reconnectInterval);
+        // Attempt to reconnect with exponential backoff
+        if (!reconnectTimeoutRef.current && reconnectAttempts.current < maxReconnectAttempts) {
+          reconnectAttempts.current++;
+          
+          // Exponential backoff: 5s, 10s, 20s, 40s, max 60s
+          currentDelay.current = Math.min(reconnectInterval * Math.pow(2, reconnectAttempts.current - 1), 60000);
+          
+          console.log(`Reconnecting in ${currentDelay.current / 1000}s (attempt ${reconnectAttempts.current}/${maxReconnectAttempts})`);
+          reconnectTimeoutRef.current = setTimeout(connect, currentDelay.current);
+        } else if (reconnectAttempts.current >= maxReconnectAttempts) {
+          console.error(`Max reconnection attempts (${maxReconnectAttempts}) reached. Please refresh the page.`);
         }
       };
 

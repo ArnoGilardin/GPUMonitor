@@ -1,16 +1,18 @@
 version: '3.8'
 
 services:
+  # GPU-enabled collector (requires NVIDIA Container Toolkit)
   gpu-collector:
     build: .
     container_name: gpu-monitor-collector
     restart: unless-stopped
     environment:
-      - CENTRAL_API_URL=${CENTRAL_API_URL:-http://host.docker.internal:5000}
-      - CENTRAL_API_KEY=${CENTRAL_API_KEY:-collector-key-123}
-      - SERVER_ID=${SERVER_ID:-docker-collector}
-      - SERVER_NAME=${SERVER_NAME:-Docker Collector}
-      - SERVER_TAGS=${SERVER_TAGS:-docker,gpu}
+      # REQUIRED: Set these in .env file
+      - CENTRAL_API_URL=${CENTRAL_API_URL}
+      - CENTRAL_API_KEY=${CENTRAL_API_KEY}
+      - SERVER_ID=${SERVER_ID}
+      - SERVER_NAME=${SERVER_NAME}
+      - SERVER_TAGS=${SERVER_TAGS:-gpu}
       - INTERVAL_SEC=${INTERVAL_SEC:-30}
     volumes:
       - /proc:/host/proc:ro
@@ -25,6 +27,11 @@ services:
               count: all
               capabilities: [gpu]
     network_mode: host
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
     
   # Alternative service without GPU access for CPU-only servers
   cpu-collector:
@@ -32,14 +39,21 @@ services:
     container_name: gpu-monitor-collector-cpu
     restart: unless-stopped
     environment:
-      - CENTRAL_API_URL=${CENTRAL_API_URL:-http://host.docker.internal:5000}
-      - CENTRAL_API_KEY=${CENTRAL_API_KEY:-collector-key-123}
-      - SERVER_ID=${SERVER_ID:-docker-collector-cpu}
-      - SERVER_NAME=${SERVER_NAME:-Docker CPU Collector}
-      - SERVER_TAGS=${SERVER_TAGS:-docker,cpu-only}
+      # REQUIRED: Set these in .env file
+      - CENTRAL_API_URL=${CENTRAL_API_URL}
+      - CENTRAL_API_KEY=${CENTRAL_API_KEY}
+      - SERVER_ID=${SERVER_ID}
+      - SERVER_NAME=${SERVER_NAME}
+      - SERVER_TAGS=${SERVER_TAGS:-cpu-only}
       - INTERVAL_SEC=${INTERVAL_SEC:-30}
     volumes:
       - /proc:/host/proc:ro
       - /sys:/host/sys:ro
+    network_mode: host
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
     profiles:
       - cpu-only

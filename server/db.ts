@@ -13,3 +13,15 @@ if (!process.env.DATABASE_URL) {
 
 export const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 export const db = drizzle({ client: pool, schema });
+
+// Test database connection on startup
+pool.connect()
+  .then(client => {
+    console.log("✅ Database connection successful");
+    client.release();
+  })
+  .catch(err => {
+    console.error("❌ Database connection failed:", err.message);
+    console.error("Please check your DATABASE_URL environment variable");
+    process.exit(1);
+  });

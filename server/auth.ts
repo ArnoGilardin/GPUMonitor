@@ -76,9 +76,9 @@ export function requireRole(requiredRole: string) {
 export async function refreshAccessToken(refreshToken: string, userRole: string): Promise<string | null> {
   try {
     // Verify refresh token
-    const decoded = jwt.verify(refreshToken, REFRESH_TOKEN_SECRET) as { 
-      userId: string; 
-      type: string; 
+    const decoded = jwt.verify(refreshToken, REFRESH_TOKEN_SECRET) as {
+      userId: string;
+      type: string;
     };
     
     if (decoded.type !== "refresh") {
@@ -89,6 +89,17 @@ export async function refreshAccessToken(refreshToken: string, userRole: string)
     const storedToken = await storage.getRefreshToken(refreshToken);
     if (!storedToken || storedToken.expiresAt < new Date()) {
       return null;
+    }
+    
+    // Prevent token reuse: check if recently used (within last 5 seconds)
+    if (storedToken.lastUsedAt) {
+      const timeSinceLastUse = Date.now() - storedToken.lastUsedAt.getTime();
+      if (timeSinceLastUse < 5000) {
+        console.warn(`Potential token reuse detected for user ${decoded.userId}`);
+        // Optionally revoke the token for security
+        await storage.revokeRefreshToken(refreshToken);
+        return null;
+      }
     }
     
     // Update last used timestamp
