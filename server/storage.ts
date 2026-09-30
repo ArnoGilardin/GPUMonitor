@@ -1,14 +1,15 @@
-import { 
-  servers, 
-  gpuSnapshots, 
-  sysSnapshots, 
-  alerts, 
-  rules, 
-  settings, 
+import {
+  servers,
+  gpuSnapshots,
+  sysSnapshots,
+  alerts,
+  rules,
+  settings,
   users,
   refreshTokens,
   securityAuditLog,
-  type Server, 
+  SETTING_DEFAULTS,
+  type Server,
   type InsertServer,
   type GpuSnapshot,
   type InsertGpuSnapshot,
@@ -18,439 +19,415 @@ import {
   type InsertAlert,
   type Rule,
   type InsertRule,
-  type Setting,
-  type InsertSetting,
-  type User, 
+  type SettingKey,
+  type User,
   type InsertUser,
   type RefreshToken,
   type InsertRefreshToken,
   type SecurityAuditLog,
-  type InsertSecurityAuditLog
+  type InsertSecurityAuditLog,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, desc, and, gte, isNull, sql } from "drizzle-orm";
+import { eq, desc, and, gte, lt, isNull, isNotNull, sql, count } from "drizzle-orm";
 
-export interface IStorage {
-  // User management
-  getUser(id: string): Promise<User | undefined>;
-  getUserByUsername(username: string): Promise<User | undefined>;
-  createUser(user: InsertUser): Promise<User>;
+export type AlertWithRefs = Alert & {
+  server: { name: string | null } | null;
+  rule: { name: string | null; type: string | null } | null;
+};
 
-  // Server management
-  upsertServer(server: InsertServer): Promise<void>;
-  getServersWithMetrics(): Promise<any[]>;
-  getServerWithDetails(id: string): Promise<any>;
-  getServerMetrics(serverId: string, hours: number): Promise<any>;
-
-  // Metrics ingestion
-  insertGpuSnapshot(snapshot: InsertGpuSnapshot): Promise<void>;
-  insertSysSnapshot(snapshot: InsertSysSnapshot): Promise<void>;
-
-  // Alerts and rules
-  getAlerts(resolved?: boolean): Promise<Alert[]>;
-  getActiveAlert(serverId: string, ruleId: string): Promise<Alert | undefined>;
-  createAlert(alert: InsertAlert): Promise<Alert>;
-  resolveAlert(alertId: string): Promise<void>;
-  getRules(): Promise<Rule[]>;
-  getActiveRules(): Promise<Rule[]>;
-  createRule(rule: InsertRule): Promise<Rule>;
-  updateRule(ruleId: string, updates: Partial<InsertRule>): Promise<Rule>;
-  deleteRule(ruleId: string): Promise<void>;
-  checkAlertDuration(serverId: string, ruleId: string, durationSec: number): Promise<boolean>;
-
-  // Settings
-  getSettings(): Promise<Setting[]>;
-  updateSettings(updates: Record<string, string>): Promise<void>;
-
-  // Stats and monitoring
-  getStats(): Promise<any>;
-  getLatestMetrics(serverId: string): Promise<any>;
-
-  // Security features
-  storeRefreshToken(token: InsertRefreshToken): Promise<RefreshToken>;
-  getRefreshToken(token: string): Promise<RefreshToken | undefined>;
-  revokeRefreshToken(token: string): Promise<void>;
-  cleanupExpiredTokens(): Promise<void>;
-  updateRefreshTokenLastUsed(token: string, lastUsedAt: Date): Promise<void>;
-  logSecurityEvent(event: InsertSecurityAuditLog): Promise<SecurityAuditLog>;
-  getSecurityAuditLog(limit?: number): Promise<SecurityAuditLog[]>;
+export interface AlertFilter {
+  status?: "active" | "resolved" | "all";
+  serverId?: string;
+  limit?: number;
 }
 
-export class DatabaseStorage implements IStorage {
+export interface HostInfo {
+  hostname?: string;
+  os?: string;
+  cpuModel?: string;
+  cpuCores?: number;
+  collectorVersion?: string;
+}
+
+export interface MetricBucket {
+  ts: string;
+  [key: string]: number | string | null;
+}
+
+const num = (v: string | number | null | undefined): number | null =>
+  v === null || v === undefined ? null : Number(v);
+
+export class DatabaseStorage {
+  // ---------------------------------------------------------------- users
   async getUser(id: string): Promise<User | undefined> {
     const [user] = await db.select().from(users).where(eq(users.id, id));
-    return user || undefined;
+    return user;
   }
 
   async getUserByUsername(username: string): Promise<User | undefined> {
     const [user] = await db.select().from(users).where(eq(users.username, username));
-    return user || undefined;
-  }
-
-  async createUser(insertUser: InsertUser): Promise<User> {
-    const [user] = await db
-      .insert(users)
-      .values(insertUser)
-      .returning();
     return user;
   }
 
-  async upsertServer(server: InsertServer): Promise<void> {
-    await db
+  async createUser(insertUser: InsertUser): Promise<User> {
+    const [user] = await db.insert(users).values(insertUser).returning();
+    return user;
+  }
+
+  async listUsers(): Promise<Array<Pick<User, "id" | "username" | "role" | "createdAt">>> {
+    return db
+      .select({ id: users.id, username: users.username, role: users.role, createdAt: users.createdAt })
+      .from(users)
+      .orderBy(users.username);
+  }
+
+  async updateUser(id: string, updates: Partial<Pick<User, "role" | "passwordHash">>): Promise<User | undefined> {
+    const [user] = await db.update(users).set(updates).where(eq(users.id, id)).returning();
+    return user;
+  }
+
+  async deleteUser(id: string): Promise<void> {
+    await db.delete(users).where(eq(users.id, id));
+  }
+
+  async countUsers(role?: string): Promise<number> {
+    const [row] = await db
+      .select({ n: count() })
+      .from(users)
+      .where(role ? eq(users.role, role) : undefined);
+    return Number(row?.n ?? 0);
+  }
+
+  async revokeUserTokens(userId: string): Promise<void> {
+    await db.delete(refreshTokens).where(eq(refreshTokens.userId, userId));
+  }
+
+  // -------------------------------------------------------------- servers
+  async listServers(): Promise<Server[]> {
+    return db.select().from(servers).orderBy(servers.name);
+  }
+
+  async getServer(id: string): Promise<Server | undefined> {
+    const [server] = await db.select().from(servers).where(eq(servers.id, id));
+    return server;
+  }
+
+  async getServerByKeyHash(hash: string): Promise<Server | undefined> {
+    const [server] = await db.select().from(servers).where(eq(servers.apiKeyHash, hash));
+    return server;
+  }
+
+  async createServer(server: InsertServer): Promise<Server> {
+    const [created] = await db.insert(servers).values(server).returning();
+    return created;
+  }
+
+  async updateServer(id: string, updates: Partial<InsertServer>): Promise<Server | undefined> {
+    const [updated] = await db.update(servers).set(updates).where(eq(servers.id, id)).returning();
+    return updated;
+  }
+
+  async deleteServer(id: string): Promise<void> {
+    await db.delete(servers).where(eq(servers.id, id));
+  }
+
+  /**
+   * Called on every ingest. Servers registered from the UI keep their
+   * name/tags (the UI is the source of truth); auto-registered servers
+   * (no per-server key) follow what the collector reports.
+   */
+  async upsertServerFromIngest(
+    data: { id: string; name: string; tags: string[]; ip: string | null },
+    host: HostInfo | undefined,
+  ): Promise<Server> {
+    const now = new Date();
+    const hostFields = {
+      hostname: host?.hostname ?? null,
+      os: host?.os ?? null,
+      cpuModel: host?.cpuModel ?? null,
+      cpuCores: host?.cpuCores ?? null,
+      collectorVersion: host?.collectorVersion ?? null,
+    };
+    const [row] = await db
       .insert(servers)
-      .values({
-        ...server,
-        lastSeenAt: new Date(),
-      })
+      .values({ ...data, ...hostFields, lastSeenAt: now })
       .onConflictDoUpdate({
         target: servers.id,
         set: {
-          name: server.name,
-          tags: server.tags,
-          ip: server.ip,
-          lastSeenAt: new Date(),
+          name: sql`CASE WHEN ${servers.apiKeyHash} IS NULL THEN excluded.name ELSE ${servers.name} END`,
+          tags: sql`CASE WHEN ${servers.apiKeyHash} IS NULL THEN excluded.tags ELSE ${servers.tags} END`,
+          ip: data.ip,
+          hostname: sql`COALESCE(excluded.hostname, ${servers.hostname})`,
+          os: sql`COALESCE(excluded.os, ${servers.os})`,
+          cpuModel: sql`COALESCE(excluded.cpu_model, ${servers.cpuModel})`,
+          cpuCores: sql`COALESCE(excluded.cpu_cores, ${servers.cpuCores})`,
+          collectorVersion: sql`COALESCE(excluded.collector_version, ${servers.collectorVersion})`,
+          lastSeenAt: now,
         },
-      });
-  }
-
-  async getServersWithMetrics(): Promise<any[]> {
-    const serverList = await db
-      .select({
-        id: servers.id,
-        name: servers.name,
-        tags: servers.tags,
-        ip: servers.ip,
-        lastSeenAt: servers.lastSeenAt,
-        createdAt: servers.createdAt,
       })
-      .from(servers)
-      .orderBy(servers.name);
+      .returning();
+    return row;
+  }
 
-    const result = [];
-    for (const server of serverList) {
-      // Get latest system metrics
-      const [latestSys] = await db
-        .select()
-        .from(sysSnapshots)
-        .where(eq(sysSnapshots.serverId, server.id))
-        .orderBy(desc(sysSnapshots.ts))
-        .limit(1);
+  // ------------------------------------------------------------ snapshots
+  async insertSnapshots(sys: InsertSysSnapshot, gpus: InsertGpuSnapshot[]): Promise<void> {
+    await db.transaction(async (tx) => {
+      await tx.insert(sysSnapshots).values(sys);
+      if (gpus.length) await tx.insert(gpuSnapshots).values(gpus);
+    });
+  }
 
-      // Get latest GPU metrics
-      const latestGpus = await db
-        .select()
-        .from(gpuSnapshots)
-        .where(eq(gpuSnapshots.serverId, server.id))
-        .orderBy(desc(gpuSnapshots.ts))
-        .limit(10);
+  /** Latest system snapshot of each server (one query). */
+  async latestSysByServer(serverIds?: string[]): Promise<Map<string, SysSnapshot>> {
+    const where = serverIds?.length ? sql`WHERE server_id IN ${serverIdsSql(serverIds)}` : sql``;
+    const result = await db.execute(sql`
+      SELECT DISTINCT ON (server_id) *
+      FROM ${sysSnapshots}
+      ${where}
+      ORDER BY server_id, ts DESC`);
+    const map = new Map<string, SysSnapshot>();
+    for (const row of result.rows as any[]) map.set(row.server_id, mapSysRow(row));
+    return map;
+  }
 
-      // Calculate server status
-      const lastSeen = server.lastSeenAt ? new Date(server.lastSeenAt) : null;
-      const now = new Date();
-      const minutesSinceLastSeen = lastSeen ? (now.getTime() - lastSeen.getTime()) / 1000 / 60 : Infinity;
-
-      let status = "offline";
-      if (minutesSinceLastSeen < 2) {
-        // Check for critical conditions
-        const hasCriticalTemp = latestGpus.some(gpu => parseFloat(gpu.tempC || "0") > 85);
-        const hasCriticalUtil = latestSys && parseFloat(latestSys.cpuPercent || "0") > 90;
-        
-        if (hasCriticalTemp || hasCriticalUtil) {
-          status = "error";
-        } else {
-          // Check for warning conditions
-          const hasWarningTemp = latestGpus.some(gpu => parseFloat(gpu.tempC || "0") > 80);
-          const hasWarningUtil = latestSys && (
-            parseFloat(latestSys.cpuPercent || "0") > 80 || 
-            parseFloat(latestSys.ramPercent || "0") > 85
-          );
-          
-          status = hasWarningTemp || hasWarningUtil ? "warning" : "online";
-        }
-      }
-
-      // Calculate average GPU utilization
-      const avgGpuUtil = latestGpus.length > 0 
-        ? latestGpus.reduce((sum, gpu) => sum + parseFloat(gpu.utilPercent || "0"), 0) / latestGpus.length
-        : 0;
-
-      result.push({
-        ...server,
-        status,
-        cpuPercent: latestSys ? parseFloat(latestSys.cpuPercent || "0") : undefined,
-        ramPercent: latestSys ? parseFloat(latestSys.ramPercent || "0") : undefined,
-        gpuUtil: Math.round(avgGpuUtil),
-        gpus: latestGpus.map(gpu => ({
-          name: gpu.vendor === "nvidia" ? "NVIDIA GPU" : "AMD GPU",
-          tempC: parseFloat(gpu.tempC || "0"),
-          powerW: parseFloat(gpu.powerW || "0"),
-        })),
-        lastSeen: minutesSinceLastSeen < 60 
-          ? `${Math.round(minutesSinceLastSeen)}m ago`
-          : minutesSinceLastSeen < 1440
-            ? `${Math.round(minutesSinceLastSeen / 60)}h ago`
-            : `${Math.round(minutesSinceLastSeen / 1440)}d ago`,
-      });
+  /**
+   * Latest snapshot of each GPU of each server. Only GPUs that reported
+   * during the server's last 10 minutes of activity are kept, so removed
+   * GPUs disappear.
+   */
+  async latestGpusByServer(serverIds?: string[]): Promise<Map<string, GpuSnapshot[]>> {
+    const filter = serverIds?.length ? sql`AND g.server_id IN ${serverIdsSql(serverIds)}` : sql``;
+    const result = await db.execute(sql`
+      SELECT DISTINCT ON (g.server_id, g.gpu_index) g.*
+      FROM ${gpuSnapshots} g
+      JOIN ${servers} s ON s.id = g.server_id
+      WHERE g.ts > COALESCE(s.last_seen_at, now()) - interval '10 minutes' ${filter}
+      ORDER BY g.server_id, g.gpu_index, g.ts DESC`);
+    const map = new Map<string, GpuSnapshot[]>();
+    for (const row of result.rows as any[]) {
+      const list = map.get(row.server_id) ?? [];
+      list.push(mapGpuRow(row));
+      map.set(row.server_id, list);
     }
-
-    return result;
+    return map;
   }
 
-  async getServerWithDetails(id: string): Promise<any> {
-    const [server] = await db
-      .select()
-      .from(servers)
-      .where(eq(servers.id, id));
+  /** Time series averaged into buckets so charts stay light for long ranges. */
+  async getServerMetrics(serverId: string, hours: number): Promise<{
+    bucketSec: number;
+    system: MetricBucket[];
+    gpus: MetricBucket[];
+  }> {
+    const bucketSec = pickBucket(hours);
+    const since = new Date(Date.now() - hours * 3600 * 1000);
+    const bucket = sql.raw(`to_timestamp(floor(extract(epoch from ts) / ${bucketSec}) * ${bucketSec})`);
 
-    if (!server) return null;
-
-    // Get latest GPU snapshots
-    const latestGpus = await db
-      .select()
-      .from(gpuSnapshots)
-      .where(eq(gpuSnapshots.serverId, id))
-      .orderBy(desc(gpuSnapshots.ts))
-      .limit(10);
-
-    // Get latest system snapshot
-    const [latestSys] = await db
-      .select()
-      .from(sysSnapshots)
-      .where(eq(sysSnapshots.serverId, id))
-      .orderBy(desc(sysSnapshots.ts))
-      .limit(1);
-
-    return {
-      ...server,
-      gpus: latestGpus.map(gpu => ({
-        ...gpu,
-        model: `${gpu.vendor?.toUpperCase()} GPU`,
-        utilPercent: parseFloat(gpu.utilPercent || "0"),
-        tempC: parseFloat(gpu.tempC || "0"),
-        powerW: parseFloat(gpu.powerW || "0"),
-        fanPercent: parseFloat(gpu.fanPercent || "0"),
-      })),
-      system: latestSys,
-    };
-  }
-
-  async getServerMetrics(serverId: string, hours: number): Promise<any> {
-    const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-
-    const [gpuMetrics, sysMetrics] = await Promise.all([
-      db
-        .select()
-        .from(gpuSnapshots)
-        .where(and(
-          eq(gpuSnapshots.serverId, serverId),
-          gte(gpuSnapshots.ts, since)
-        ))
-        .orderBy(gpuSnapshots.ts),
-      db
-        .select()
-        .from(sysSnapshots)
-        .where(and(
-          eq(sysSnapshots.serverId, serverId),
-          gte(sysSnapshots.ts, since)
-        ))
-        .orderBy(sysSnapshots.ts),
+    const [sysResult, gpuResult] = await Promise.all([
+      db.execute(sql`
+        SELECT ${bucket} AS bucket,
+          avg(cpu_percent)::float AS cpu,
+          avg(ram_percent)::float AS ram,
+          avg(disk_percent)::float AS disk,
+          avg(load1)::float AS load1,
+          avg(net_rx_bps)::float AS net_rx,
+          avg(net_tx_bps)::float AS net_tx
+        FROM ${sysSnapshots}
+        WHERE server_id = ${serverId} AND ts >= ${since}
+        GROUP BY 1 ORDER BY 1`),
+      db.execute(sql`
+        SELECT ${bucket} AS bucket, gpu_index,
+          avg(util_percent)::float AS util,
+          avg(temp_c)::float AS temp,
+          avg(power_w)::float AS power,
+          avg(CASE WHEN vram_total_mb > 0 THEN vram_used_mb * 100.0 / vram_total_mb END)::float AS vram
+        FROM ${gpuSnapshots}
+        WHERE server_id = ${serverId} AND ts >= ${since}
+        GROUP BY 1, 2 ORDER BY 1, 2`),
     ]);
 
-    return { gpuMetrics, sysMetrics };
+    const round = (v: unknown) => (v === null || v === undefined ? null : Math.round(Number(v) * 10) / 10);
+    const system = (sysResult.rows as any[]).map((r) => ({
+      ts: new Date(r.bucket).toISOString(),
+      cpu: round(r.cpu),
+      ram: round(r.ram),
+      disk: round(r.disk),
+      load1: round(r.load1),
+      netRx: round(r.net_rx),
+      netTx: round(r.net_tx),
+    }));
+
+    // One row per bucket with gpu{N}_util / gpu{N}_temp / ... columns plus fleet aggregates
+    const byTs = new Map<string, MetricBucket>();
+    for (const r of gpuResult.rows as any[]) {
+      const ts = new Date(r.bucket).toISOString();
+      const row = byTs.get(ts) ?? { ts, powerTotal: 0 };
+      const i = r.gpu_index;
+      row[`gpu${i}_util`] = round(r.util);
+      row[`gpu${i}_temp`] = round(r.temp);
+      row[`gpu${i}_power`] = round(r.power);
+      row[`gpu${i}_vram`] = round(r.vram);
+      row.powerTotal = round(Number(row.powerTotal) + Number(r.power || 0));
+      byTs.set(ts, row);
+    }
+    return { bucketSec, system, gpus: Array.from(byTs.values()) };
   }
 
-  async insertGpuSnapshot(snapshot: InsertGpuSnapshot): Promise<void> {
-    await db.insert(gpuSnapshots).values(snapshot);
+  async exportServerMetrics(serverId: string, hours: number) {
+    const since = new Date(Date.now() - hours * 3600 * 1000);
+    const [sys, gpus] = await Promise.all([
+      db.select().from(sysSnapshots)
+        .where(and(eq(sysSnapshots.serverId, serverId), gte(sysSnapshots.ts, since)))
+        .orderBy(sysSnapshots.ts),
+      db.select().from(gpuSnapshots)
+        .where(and(eq(gpuSnapshots.serverId, serverId), gte(gpuSnapshots.ts, since)))
+        .orderBy(gpuSnapshots.ts, gpuSnapshots.gpuIndex),
+    ]);
+    return { sys, gpus };
   }
 
-  async insertSysSnapshot(snapshot: InsertSysSnapshot): Promise<void> {
-    await db.insert(sysSnapshots).values(snapshot);
-  }
+  // --------------------------------------------------------------- alerts
+  async getAlerts(filter: AlertFilter = {}): Promise<AlertWithRefs[]> {
+    const conditions = [];
+    if (filter.status === "active") conditions.push(isNull(alerts.resolvedAt));
+    if (filter.status === "resolved") conditions.push(isNotNull(alerts.resolvedAt));
+    if (filter.serverId) conditions.push(eq(alerts.serverId, filter.serverId));
 
-  async getAlerts(resolved?: boolean): Promise<Alert[]> {
-    const baseQuery = db
+    const rows = await db
       .select({
-        id: alerts.id,
-        serverId: alerts.serverId,
-        ruleId: alerts.ruleId,
-        level: alerts.level,
-        message: alerts.message,
-        firedAt: alerts.firedAt,
-        resolvedAt: alerts.resolvedAt,
-        server: {
-          name: servers.name,
-        },
-        rule: {
-          name: rules.name,
-        },
+        alert: alerts,
+        serverName: servers.name,
+        ruleName: rules.name,
+        ruleType: rules.type,
       })
       .from(alerts)
       .leftJoin(servers, eq(alerts.serverId, servers.id))
-      .leftJoin(rules, eq(alerts.ruleId, rules.id));
+      .leftJoin(rules, eq(alerts.ruleId, rules.id))
+      .where(conditions.length ? and(...conditions) : undefined)
+      .orderBy(desc(alerts.firedAt))
+      .limit(Math.min(filter.limit ?? 500, 2000));
 
-    if (resolved === true) {
-      return baseQuery
-        .where(sql`${alerts.resolvedAt} IS NOT NULL`)
-        .orderBy(desc(alerts.firedAt));
-    } else if (resolved === false) {
-      return baseQuery
-        .where(isNull(alerts.resolvedAt))
-        .orderBy(desc(alerts.firedAt));
-    }
+    return rows.map((r) => ({
+      ...r.alert,
+      server: { name: r.serverName },
+      rule: { name: r.ruleName, type: r.ruleType },
+    }));
+  }
 
-    return baseQuery.orderBy(desc(alerts.firedAt));
+  async getActiveAlerts(): Promise<Alert[]> {
+    return db.select().from(alerts).where(isNull(alerts.resolvedAt));
   }
 
   async getActiveAlert(serverId: string, ruleId: string): Promise<Alert | undefined> {
     const [alert] = await db
       .select()
       .from(alerts)
-      .where(and(
-        eq(alerts.serverId, serverId),
-        eq(alerts.ruleId, ruleId),
-        isNull(alerts.resolvedAt)
-      ));
+      .where(and(eq(alerts.serverId, serverId), eq(alerts.ruleId, ruleId), isNull(alerts.resolvedAt)));
     return alert;
   }
 
   async createAlert(alert: InsertAlert): Promise<Alert> {
-    const [newAlert] = await db
-      .insert(alerts)
-      .values(alert)
-      .returning();
-    return newAlert;
+    const [created] = await db.insert(alerts).values(alert).returning();
+    return created;
   }
 
-  async resolveAlert(alertId: string): Promise<void> {
+  async resolveAlert(alertId: string, by: string): Promise<Alert | undefined> {
+    const [alert] = await db
+      .update(alerts)
+      .set({ resolvedAt: new Date(), resolvedBy: by })
+      .where(and(eq(alerts.id, alertId), isNull(alerts.resolvedAt)))
+      .returning();
+    return alert;
+  }
+
+  async acknowledgeAlert(alertId: string, by: string): Promise<Alert | undefined> {
+    const [alert] = await db
+      .update(alerts)
+      .set({ acknowledgedAt: new Date(), acknowledgedBy: by })
+      .where(and(eq(alerts.id, alertId), isNull(alerts.resolvedAt), isNull(alerts.acknowledgedAt)))
+      .returning();
+    return alert;
+  }
+
+  async resolveAlertsForServer(serverId: string, by: string): Promise<void> {
     await db
       .update(alerts)
-      .set({ resolvedAt: new Date() })
-      .where(eq(alerts.id, alertId));
+      .set({ resolvedAt: new Date(), resolvedBy: by })
+      .where(and(eq(alerts.serverId, serverId), isNull(alerts.resolvedAt)));
   }
 
+  async countResolvedSince(since: Date): Promise<number> {
+    const [row] = await db.select({ n: count() }).from(alerts).where(gte(alerts.resolvedAt, since));
+    return Number(row?.n ?? 0);
+  }
+
+  // ---------------------------------------------------------------- rules
   async getRules(): Promise<Rule[]> {
     return db.select().from(rules).orderBy(rules.name);
   }
 
   async getActiveRules(): Promise<Rule[]> {
-    return db
-      .select()
-      .from(rules)
-      .where(eq(rules.enabled, true));
+    return db.select().from(rules).where(eq(rules.enabled, true));
   }
 
   async createRule(rule: InsertRule): Promise<Rule> {
-    const [newRule] = await db
-      .insert(rules)
-      .values(rule)
-      .returning();
-    return newRule;
+    const [created] = await db.insert(rules).values(rule).returning();
+    return created;
   }
 
-  async updateRule(ruleId: string, updates: Partial<InsertRule>): Promise<Rule> {
-    const [updatedRule] = await db
-      .update(rules)
-      .set(updates)
-      .where(eq(rules.id, ruleId))
-      .returning();
-    return updatedRule;
+  async updateRule(ruleId: string, updates: Partial<InsertRule>): Promise<Rule | undefined> {
+    const [updated] = await db.update(rules).set(updates).where(eq(rules.id, ruleId)).returning();
+    return updated;
   }
 
   async deleteRule(ruleId: string): Promise<void> {
     await db.delete(rules).where(eq(rules.id, ruleId));
   }
 
-  async checkAlertDuration(serverId: string, ruleId: string, durationSec: number): Promise<boolean> {
-    // For simplicity, we'll check if there have been consistent violations
-    // In a real implementation, you'd want to track violation history
-    return true; // Simplified - fire alert immediately
+  async countRules(): Promise<number> {
+    const [row] = await db.select({ n: count() }).from(rules);
+    return Number(row?.n ?? 0);
   }
 
-  async getSettings(): Promise<Setting[]> {
-    return db.select().from(settings);
+  // ------------------------------------------------------------- settings
+  async getSettings(): Promise<Record<SettingKey, string>> {
+    const rows = await db.select().from(settings);
+    const result = { ...SETTING_DEFAULTS };
+    for (const row of rows) {
+      if (row.key in result) result[row.key as SettingKey] = row.value ?? "";
+    }
+    return result;
   }
 
-  async updateSettings(updates: Record<string, string>): Promise<void> {
+  async updateSettings(updates: Partial<Record<SettingKey, string>>): Promise<void> {
     for (const [key, value] of Object.entries(updates)) {
+      if (value === undefined) continue;
       await db
         .insert(settings)
         .values({ key, value })
-        .onConflictDoUpdate({
-          target: settings.key,
-          set: { value, updatedAt: new Date() },
-        });
+        .onConflictDoUpdate({ target: settings.key, set: { value, updatedAt: new Date() } });
     }
   }
 
-  async getStats(): Promise<any> {
-    const [serverStats] = await db
-      .select({
-        totalServers: sql<number>`count(*)`,
-        onlineServers: sql<number>`count(*) filter (where ${servers.lastSeenAt} > now() - interval '2 minutes')`,
-      })
-      .from(servers);
-
-    const [gpuStats] = await db
-      .select({
-        totalGpus: sql<number>`count(distinct concat(${gpuSnapshots.serverId}, '-', ${gpuSnapshots.gpuIndex}))`,
-        avgGpuUtil: sql<number>`avg(cast(${gpuSnapshots.utilPercent} as numeric))`,
-      })
-      .from(gpuSnapshots)
-      .where(gte(gpuSnapshots.ts, sql`now() - interval '1 hour'`));
-
-    const [powerStats] = await db
-      .select({
-        totalPowerKW: sql<number>`sum(cast(${gpuSnapshots.powerW} as numeric)) / 1000`,
-      })
-      .from(gpuSnapshots)
-      .where(gte(gpuSnapshots.ts, sql`now() - interval '1 hour'`));
-
-    return {
-      totalServers: serverStats?.totalServers || 0,
-      onlineServers: serverStats?.onlineServers || 0,
-      totalGpus: gpuStats?.totalGpus || 0,
-      avgGpuUtil: Math.round(gpuStats?.avgGpuUtil || 0),
-      totalPowerKW: parseFloat((powerStats?.totalPowerKW || 0).toFixed(1)),
-    };
+  // ------------------------------------------------------------ retention
+  async purgeOldData(metricsDays: number, alertsDays: number): Promise<{ snapshots: number; alerts: number }> {
+    const metricsCutoff = new Date(Date.now() - metricsDays * 86400 * 1000);
+    const alertsCutoff = new Date(Date.now() - alertsDays * 86400 * 1000);
+    const g = await db.delete(gpuSnapshots).where(lt(gpuSnapshots.ts, metricsCutoff));
+    const s = await db.delete(sysSnapshots).where(lt(sysSnapshots.ts, metricsCutoff));
+    const a = await db.delete(alerts).where(and(isNotNull(alerts.resolvedAt), lt(alerts.resolvedAt, alertsCutoff)));
+    await db.delete(securityAuditLog).where(lt(securityAuditLog.timestamp, alertsCutoff));
+    return { snapshots: (g.rowCount ?? 0) + (s.rowCount ?? 0), alerts: a.rowCount ?? 0 };
   }
 
-  async getLatestMetrics(serverId: string): Promise<any> {
-    const [server] = await db
-      .select()
-      .from(servers)
-      .where(eq(servers.id, serverId));
-
-    if (!server) return null;
-
-    const [sysSnapshot] = await db
-      .select()
-      .from(sysSnapshots)
-      .where(eq(sysSnapshots.serverId, serverId))
-      .orderBy(desc(sysSnapshots.ts))
-      .limit(1);
-
-    const gpuSnapshotData = await db
-      .select()
-      .from(gpuSnapshots)
-      .where(eq(gpuSnapshots.serverId, serverId))
-      .orderBy(desc(gpuSnapshots.ts))
-      .limit(10);
-
-    return {
-      server,
-      sysSnapshot,
-      gpuSnapshots: gpuSnapshotData,
-    };
-  }
-  // Security features implementation
+  // ------------------------------------------------------------- security
   async storeRefreshToken(tokenData: InsertRefreshToken): Promise<RefreshToken> {
     const [token] = await db.insert(refreshTokens).values(tokenData).returning();
     return token;
   }
 
   async getRefreshToken(token: string): Promise<RefreshToken | undefined> {
-    const [refreshToken] = await db.select().from(refreshTokens).where(eq(refreshTokens.token, token));
-    return refreshToken || undefined;
+    const [row] = await db.select().from(refreshTokens).where(eq(refreshTokens.token, token));
+    return row;
   }
 
   async revokeRefreshToken(token: string): Promise<void> {
@@ -458,13 +435,11 @@ export class DatabaseStorage implements IStorage {
   }
 
   async cleanupExpiredTokens(): Promise<void> {
-    await db.delete(refreshTokens).where(sql`expires_at < NOW()`);
+    await db.delete(refreshTokens).where(lt(refreshTokens.expiresAt, new Date()));
   }
 
   async updateRefreshTokenLastUsed(token: string, lastUsedAt: Date): Promise<void> {
-    await db.update(refreshTokens)
-      .set({ lastUsedAt })
-      .where(eq(refreshTokens.token, token));
+    await db.update(refreshTokens).set({ lastUsedAt }).where(eq(refreshTokens.token, token));
   }
 
   async logSecurityEvent(eventData: InsertSecurityAuditLog): Promise<SecurityAuditLog> {
@@ -472,11 +447,71 @@ export class DatabaseStorage implements IStorage {
     return event;
   }
 
-  async getSecurityAuditLog(limit: number = 100): Promise<SecurityAuditLog[]> {
-    return await db.select().from(securityAuditLog)
+  async getSecurityAuditLog(limit = 100): Promise<Array<SecurityAuditLog & { username: string | null }>> {
+    const rows = await db
+      .select({ event: securityAuditLog, username: users.username })
+      .from(securityAuditLog)
+      .leftJoin(users, eq(securityAuditLog.userId, users.id))
       .orderBy(desc(securityAuditLog.timestamp))
       .limit(limit);
+    return rows.map((r) => ({ ...r.event, username: r.username }));
   }
+
+  async ping(): Promise<void> {
+    await db.execute(sql`SELECT 1`);
+  }
+}
+
+function serverIdsSql(ids: string[]) {
+  return sql`(${sql.join(ids.map((id) => sql`${id}`), sql`, `)})`;
+}
+
+function pickBucket(hours: number): number {
+  if (hours <= 1) return 30;
+  if (hours <= 6) return 120;
+  if (hours <= 24) return 600;
+  if (hours <= 72) return 1800;
+  return 3600;
+}
+
+function mapSysRow(r: any): SysSnapshot {
+  return {
+    id: r.id,
+    serverId: r.server_id,
+    cpuPercent: r.cpu_percent,
+    ramPercent: r.ram_percent,
+    diskPercent: r.disk_percent,
+    load1: r.load1,
+    load5: r.load5,
+    load15: r.load15,
+    ramUsedMB: r.ram_used_mb,
+    ramTotalMB: r.ram_total_mb,
+    diskUsedGB: r.disk_used_gb,
+    diskTotalGB: r.disk_total_gb,
+    netRxBps: num(r.net_rx_bps),
+    netTxBps: num(r.net_tx_bps),
+    uptimeSec: r.uptime_sec,
+    ts: new Date(r.ts),
+  };
+}
+
+function mapGpuRow(r: any): GpuSnapshot {
+  return {
+    id: r.id,
+    serverId: r.server_id,
+    gpuIndex: r.gpu_index,
+    vendor: r.vendor,
+    name: r.name,
+    uuid: r.uuid,
+    utilPercent: r.util_percent,
+    vramUsedMB: r.vram_used_mb,
+    vramTotalMB: r.vram_total_mb,
+    tempC: r.temp_c,
+    powerW: r.power_w,
+    fanPercent: r.fan_percent,
+    driverVersion: r.driver_version,
+    ts: new Date(r.ts),
+  };
 }
 
 export const storage = new DatabaseStorage();

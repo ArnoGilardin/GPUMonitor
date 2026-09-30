@@ -1,46 +1,34 @@
-# Build stage for frontend
-FROM node:18-alpine as frontend-build
-
+# ---- build: client bundle + server bundle
+FROM node:22-alpine AS build
 WORKDIR /app
-
-# Copy package files
 COPY package*.json ./
-RUN npm ci --only=production
-
-# Copy source code
+RUN npm ci
 COPY . .
-
-# Build frontend and backend
 RUN npm run build
 
-# Production stage
-FROM node:18-alpine as production
-
+# ---- runtime
+FROM node:22-alpine AS production
 WORKDIR /app
-
-# Install dumb-init for proper signal handling
 RUN apk add --no-cache dumb-init
 
-# Create app user
-RUN addgroup -g 1001 -S nodejs && \
-    adduser -S appuser -u 1001
+COPY package*.json ./
+# drizzle-kit is a runtime dependency: it syncs the schema at startup
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Copy built application
-COPY --from=frontend-build --chown=appuser:nodejs /app/dist ./dist
-COPY --from=frontend-build --chown=appuser:nodejs /app/node_modules ./node_modules
-COPY --from=frontend-build --chown=appuser:nodejs /app/package*.json ./
+COPY --from=build /app/dist ./dist
+COPY shared ./shared
+COPY drizzle.config.ts ./
+COPY scripts/docker-entrypoint.sh ./docker-entrypoint.sh
 
-# Create data directory for SQLite fallback
-RUN mkdir -p /app/data && chown appuser:nodejs /app/data
-
+RUN addgroup -g 1001 -S nodejs && adduser -S appuser -u 1001 -G nodejs \
+    && chmod +x docker-entrypoint.sh && chown -R appuser:nodejs /app
 USER appuser
 
-EXPOSE 5000
+ENV NODE_ENV=production PORT=5100
+EXPOSE 5100
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD node -e "require('http').get('http://localhost:5000/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD node -e "require('http').get('http://localhost:'+(process.env.PORT||5100)+'/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
 
-# Use dumb-init to handle signals properly
-ENTRYPOINT ["dumb-init", "--"]
+ENTRYPOINT ["dumb-init", "--", "./docker-entrypoint.sh"]
 CMD ["node", "dist/index.js"]

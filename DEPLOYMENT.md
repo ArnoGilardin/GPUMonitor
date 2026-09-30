@@ -28,7 +28,6 @@ nano .env
 # Generate with: openssl rand -hex 32
 JWT_SECRET=<your-generated-secret>
 REFRESH_TOKEN_SECRET=<your-generated-secret>
-SESSION_SECRET=<your-generated-secret>
 COLLECTOR_API_KEY=<your-generated-key>
 
 # Database (generate with: openssl rand -base64 32)
@@ -56,47 +55,55 @@ curl http://localhost:5100/health
 ```
 
 **Services started:**
-- Application (internal port 5100)
+- Application (127.0.0.1:5100; the database schema is synced automatically at startup)
 - PostgreSQL (internal only, not exposed)
-- Redis (internal only, not exposed)
-- Nginx (ports 80/443) - if using production profile
+- Nginx (ports 80/443) - with `--profile production`
+- Fleet simulator (6 fake GPU servers) - with `--profile demo`, handy for a first look
 
-### 3. Setup Collectors (on GPU machines)
+On first start the admin account from `ADMIN_USERNAME` / `ADMIN_PASSWORD` and a
+set of default alert rules are created.
+
+### 3. Add your GPU servers
+
+For each machine:
+
+1. In the dashboard, open **Servers → Add server**, give it a name and tags.
+2. A **dedicated collector key** is displayed once, with ready-to-copy
+   Docker / systemd / Python commands.
+3. On the GPU machine, install the collector with that key:
 
 ```bash
-# On each GPU server
-cd /opt
-git clone https://github.com/your-repo/gpu-monitor.git gpu-collector
-cd gpu-collector/collector
+git clone https://github.com/your-repo/gpu-monitor.git && cd gpu-monitor
 
-# Configure
-cp .env.example .env
-nano .env
+# native install (systemd service, Python venv in /opt/gpu-monitor-collector)
+sudo ./scripts/install_collector.sh --url https://your-monitor-domain.com --key gpm_xxx --id z620-gpu-01
+
+# or as a container (NVIDIA Container Toolkit required for GPUs)
+sudo ./scripts/install_collector.sh --docker --url https://your-monitor-domain.com --key gpm_xxx --id z620-gpu-01
 ```
 
-**Collector .env:**
-```bash
-CENTRAL_API_URL=https://your-monitor-domain.com
-CENTRAL_API_KEY=<same-as-server-COLLECTOR_API_KEY>
-SERVER_ID=z620-gpu-01
-SERVER_NAME=Z620 Production
-SERVER_TAGS=gpu,production,z620
-```
+The server switches from "Waiting for data" to "Online" within one interval (30 s).
+
+**Auto-registration (alternative):** a collector started with the global
+`COLLECTOR_API_KEY` registers its server by itself. Set
+`REQUIRE_SERVER_KEYS=true` on the central server to allow per-server keys only.
 
 ```bash
-# Start collector
-docker compose up -d
-
-# Check logs
-docker compose logs -f
+# check a collector without installing anything
+CENTRAL_API_URL=https://your-monitor-domain.com CENTRAL_API_KEY=gpm_xxx \
+  python3 collector/collector.py --once     # prints OK when the report is accepted
+python3 collector/collector.py --dry-run    # prints what would be sent
 ```
 
 ### 4. Access Dashboard
 
 1. Open browser: `https://your-domain.com`
 2. Login with admin credentials
-3. Configure alerts in Settings
-4. Verify collectors appear in dashboard
+3. Set the webhook (Slack/Discord/any URL) or email recipient in **Settings → Notifications**
+   and use the test button
+4. Adjust the default alert rules in **Settings → Alert rules** (rules can target all
+   servers, a tag, or one server)
+5. Create accounts for your team in **Settings → Users** (viewer or admin)
 
 ## Architecture
 

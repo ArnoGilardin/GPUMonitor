@@ -1,325 +1,372 @@
 #!/usr/bin/env python3
 """
-GPU & Server Monitor - Lightweight Collector Agent
+GPU Monitor - lightweight collector agent
 
-This collector gathers GPU metrics (NVIDIA/AMD) and system metrics,
-then sends them to the central monitoring API.
+Collects GPU metrics (NVIDIA via nvidia-smi, AMD via rocm-smi) and system
+metrics (psutil), then sends them to the central API every INTERVAL_SEC.
+
+Environment:
+  CENTRAL_API_URL   central server, e.g. https://monitor.example.com (required)
+  CENTRAL_API_KEY   per-server key from the UI, or the global collector key (required)
+  SERVER_ID         unique id (default: hostname)
+  SERVER_NAME       display name (default: SERVER_ID)
+  SERVER_TAGS       comma separated tags (only used for auto-registered servers)
+  INTERVAL_SEC      seconds between reports (default 30)
+  DISK_PATH         filesystem to report (default /)
+  BUFFER_SIZE       reports kept in memory while the API is unreachable (default 120)
+  LOG_LEVEL         DEBUG, INFO, WARNING... (default INFO)
+
+Usage:
+  python3 collector.py            run forever
+  python3 collector.py --once     send one report and exit (exit code 1 on failure)
+  python3 collector.py --dry-run  print one report as JSON without sending it
 """
 
-import os
-import sys
-import time
 import json
 import logging
-import subprocess
+import os
 import platform
-import requests
-import psutil
-from datetime import datetime
-from typing import Dict, List, Optional, Any
+import signal
+import socket
+import subprocess
+import sys
+import time
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-# Configure logging
+import psutil
+import requests
+
+VERSION = "2.0.0"
+HEARTBEAT_FILE = os.getenv("HEARTBEAT_FILE", "/tmp/gpu-monitor-collector.heartbeat")
+
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("collector")
+
+NA_VALUES = {"", "N/A", "[N/A]", "[Not Supported]", "Not Supported", "[Unknown Error]"}
+
+
+def to_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    s = str(value).strip().rstrip("%").strip()
+    if s in NA_VALUES:
+        return default
+    try:
+        return float(s)
+    except ValueError:
+        return default
+
+
+def run(cmd: List[str], timeout: int = 20) -> Optional[str]:
+    """Run a command, returning stdout or None if it is missing or fails."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        logger.error("%s timed out", cmd[0])
+        return None
+    if result.returncode != 0:
+        logger.debug("%s failed: %s", cmd[0], result.stderr.strip())
+        return None
+    return result.stdout
+
+
+# --------------------------------------------------------------------- GPUs
+
+NVIDIA_FIELDS = [
+    "index", "name", "uuid", "utilization.gpu", "memory.total", "memory.used",
+    "temperature.gpu", "power.draw", "fan.speed", "driver_version",
+]
+
+
+def parse_nvidia_smi(output: str) -> List[Dict[str, Any]]:
+    gpus = []
+    for line in output.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < len(NVIDIA_FIELDS):
+            continue
+        # GPU names can contain commas: rebuild from both ends
+        extra = len(parts) - len(NVIDIA_FIELDS)
+        name = ", ".join(parts[1:2 + extra])
+        rest = parts[2 + extra:]
+        try:
+            gpus.append({
+                "gpuIndex": int(parts[0]),
+                "vendor": "nvidia",
+                "name": name,
+                "uuid": rest[0] if rest[0] not in NA_VALUES else None,
+                "utilPercent": to_float(rest[1]),
+                "vramTotalMB": to_float(rest[2]),
+                "vramUsedMB": to_float(rest[3]),
+                "tempC": to_float(rest[4]),
+                "powerW": to_float(rest[5]),
+                "fanPercent": to_float(rest[6]),
+                "driverVersion": rest[7] if rest[7] not in NA_VALUES else "unknown",
+            })
+        except (ValueError, IndexError) as e:
+            logger.warning("Could not parse nvidia-smi line %r: %s", line, e)
+    return gpus
+
+
+def get_nvidia_metrics() -> List[Dict[str, Any]]:
+    output = run([
+        "nvidia-smi",
+        f"--query-gpu={','.join(NVIDIA_FIELDS)}",
+        "--format=csv,noheader,nounits",
+    ])
+    return parse_nvidia_smi(output) if output else []
+
+
+def _pick(card: Dict[str, Any], *needles: str) -> Any:
+    """Find a rocm-smi value whose key contains all needles (key names vary by version)."""
+    for key, value in card.items():
+        k = key.lower()
+        if all(n in k for n in needles):
+            return value
+    return None
+
+
+def parse_rocm_smi(output: str, driver: str = "unknown") -> List[Dict[str, Any]]:
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        logger.warning("Could not parse rocm-smi JSON output")
+        return []
+    if isinstance(data.get("system"), dict):
+        driver = data["system"].get("Driver version", driver)
+    gpus = []
+    for key, card in sorted(data.items()):
+        if not key.startswith("card") or not isinstance(card, dict):
+            continue
+        try:
+            index = int(key[4:])
+        except ValueError:
+            continue
+        power = _pick(card, "power", "(w)") or _pick(card, "power")
+        vram_total = to_float(_pick(card, "vram", "total", "memory", "(b)"))
+        vram_used = to_float(_pick(card, "vram", "used", "(b)"))
+        gpus.append({
+            "gpuIndex": index,
+            "vendor": "amd",
+            "name": str(_pick(card, "card", "series") or _pick(card, "card", "model") or "AMD GPU"),
+            "uuid": str(_pick(card, "unique id")) if _pick(card, "unique id") else None,
+            "utilPercent": to_float(_pick(card, "gpu use")),
+            "vramTotalMB": round(vram_total / 1024 / 1024),
+            "vramUsedMB": round(vram_used / 1024 / 1024),
+            "tempC": to_float(_pick(card, "temperature", "edge") or _pick(card, "temperature", "junction") or _pick(card, "temperature")),
+            "powerW": to_float(power),
+            "fanPercent": to_float(_pick(card, "fan", "%")),
+            "driverVersion": str(driver),
+        })
+    return gpus
+
+
+def get_amd_metrics() -> List[Dict[str, Any]]:
+    output = run([
+        "rocm-smi", "--showuse", "--showtemp", "--showpower", "--showfan",
+        "--showmeminfo", "vram", "--showproductname", "--showdriverversion",
+        "--showuniqueid", "--json",
+    ])
+    return parse_rocm_smi(output) if output else []
+
+
+# ------------------------------------------------------------------- system
+
+def read_os_name() -> str:
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return f"{platform.system()} {platform.release()}"
+
+
+def read_cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo") as f:
+            for line in f:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or platform.machine()
+
 
 class MetricsCollector:
-    def __init__(self):
-        self.server_id = os.getenv('SERVER_ID', platform.node())
-        self.server_name = os.getenv('SERVER_NAME', self.server_id)
-        self.api_url = os.getenv('CENTRAL_API_URL', 'http://localhost:5000')
-        self.api_key = os.getenv('CENTRAL_API_KEY', 'collector-key-123')
-        self.interval = int(os.getenv('INTERVAL_SEC', '30'))
-        self.tags = os.getenv('SERVER_TAGS', '').split(',') if os.getenv('SERVER_TAGS') else []
-        
-        # Remove empty tags
-        self.tags = [tag.strip() for tag in self.tags if tag.strip()]
-        
-        logger.info(f"Collector initialized for server: {self.server_id}")
-        logger.info(f"API URL: {self.api_url}")
-        logger.info(f"Collection interval: {self.interval}s")
-        logger.info(f"Tags: {self.tags}")
+    def __init__(self) -> None:
+        self.api_url = os.getenv("CENTRAL_API_URL", "http://localhost:5100").rstrip("/")
+        self.api_key = os.getenv("CENTRAL_API_KEY", "")
+        self.server_id = os.getenv("SERVER_ID") or socket.gethostname()
+        self.server_name = os.getenv("SERVER_NAME") or self.server_id
+        self.tags = [t.strip() for t in os.getenv("SERVER_TAGS", "").split(",") if t.strip()]
+        self.interval = max(5, int(os.getenv("INTERVAL_SEC", "30")))
+        self.disk_path = os.getenv("DISK_PATH", "/")
+        self.buffer: deque = deque(maxlen=int(os.getenv("BUFFER_SIZE", "120")))
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key,
+            "User-Agent": f"gpu-monitor-collector/{VERSION}",
+        })
+        self.host = {
+            "hostname": socket.gethostname(),
+            "os": read_os_name(),
+            "cpuModel": read_cpu_model(),
+            "cpuCores": psutil.cpu_count() or 0,
+            "collectorVersion": VERSION,
+        }
+        self._last_net = None
+        self._running = True
+        psutil.cpu_percent(interval=None)  # prime: next call returns usage since now
 
-    def get_nvidia_metrics(self) -> List[Dict[str, Any]]:
-        """Collect NVIDIA GPU metrics using nvidia-smi."""
-        try:
-            # Check if nvidia-smi is available
-            result = subprocess.run(['nvidia-smi', '--version'], 
-                                  capture_output=True, text=True, timeout=10)
-            if result.returncode != 0:
-                logger.debug("nvidia-smi not available")
-                return []
+        if not self.api_key:
+            logger.warning("CENTRAL_API_KEY is empty: the API will reject reports")
+        logger.info("Collector %s for server %s (%s) -> %s every %ss",
+                    VERSION, self.server_id, self.server_name, self.api_url, self.interval)
 
-            # Get GPU count first
-            result = subprocess.run([
-                'nvidia-smi', '--list-gpus'
-            ], capture_output=True, text=True, timeout=10)
-            
-            if result.returncode != 0:
-                logger.warning("Failed to list NVIDIA GPUs")
-                return []
+    def stop(self, *_: Any) -> None:
+        logger.info("Stopping collector")
+        self._running = False
 
-            gpu_count = len([line for line in result.stdout.strip().split('\n') if line.strip()])
-            
-            if gpu_count == 0:
-                return []
-
-            # Query GPU metrics
-            cmd = [
-                'nvidia-smi',
-                '--query-gpu=index,utilization.gpu,utilization.memory,memory.total,memory.used,temperature.gpu,power.draw,fan.speed,driver_version',
-                '--format=csv,noheader,nounits'
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode != 0:
-                logger.error(f"nvidia-smi query failed: {result.stderr}")
-                return []
-
-            gpus = []
-            for line in result.stdout.strip().split('\n'):
-                if not line.strip():
-                    continue
-                    
-                parts = [part.strip() for part in line.split(',')]
-                if len(parts) >= 9:
-                    try:
-                        gpu_data = {
-                            'gpuIndex': int(parts[0]),
-                            'vendor': 'nvidia',
-                            'utilPercent': float(parts[1]) if parts[1] != '[Not Supported]' else 0,
-                            'vramUsedMB': int(parts[4]) if parts[4] != '[Not Supported]' else 0,
-                            'vramTotalMB': int(parts[3]) if parts[3] != '[Not Supported]' else 0,
-                            'tempC': float(parts[5]) if parts[5] != '[Not Supported]' else 0,
-                            'powerW': float(parts[6]) if parts[6] != '[Not Supported]' else 0,
-                            'fanPercent': float(parts[7]) if parts[7] != '[Not Supported]' else 0,
-                            'driverVersion': parts[8] if parts[8] != '[Not Supported]' else 'Unknown'
-                        }
-                        gpus.append(gpu_data)
-                    except (ValueError, IndexError) as e:
-                        logger.warning(f"Failed to parse GPU data: {line} - {e}")
-                        continue
-
-            logger.debug(f"Collected {len(gpus)} NVIDIA GPU metrics")
-            return gpus
-
-        except subprocess.TimeoutExpired:
-            logger.error("nvidia-smi command timed out")
-            return []
-        except FileNotFoundError:
-            logger.debug("nvidia-smi not found")
-            return []
-        except Exception as e:
-            logger.error(f"Error collecting NVIDIA metrics: {e}")
-            return []
-
-    def get_amd_metrics(self) -> List[Dict[str, Any]]:
-        """Collect AMD GPU metrics using rocm-smi."""
-        try:
-            # Check if rocm-smi is available
-            result = subprocess.run(['rocm-smi', '--version'], 
-                                  capture_output=True, text=True, timeout=10)
-            if result.returncode != 0:
-                logger.debug("rocm-smi not available")
-                return []
-
-            # Query AMD GPUs
-            cmd = ['rocm-smi', '--showuse', '--showtemp', '--showfan', '--showpower', '--csv']
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode != 0:
-                logger.warning(f"rocm-smi query failed: {result.stderr}")
-                return []
-
-            gpus = []
-            lines = result.stdout.strip().split('\n')
-            
-            # Skip header line
-            for i, line in enumerate(lines[1:] if len(lines) > 1 else []):
-                if not line.strip():
-                    continue
-                    
-                parts = [part.strip() for part in line.split(',')]
-                if len(parts) >= 4:
-                    try:
-                        gpu_data = {
-                            'gpuIndex': i,
-                            'vendor': 'amd',
-                            'utilPercent': float(parts[1]) if parts[1] and parts[1] != 'N/A' else 0,
-                            'vramUsedMB': 0,  # Not easily available from rocm-smi
-                            'vramTotalMB': 0,  # Not easily available from rocm-smi
-                            'tempC': float(parts[2]) if parts[2] and parts[2] != 'N/A' else 0,
-                            'powerW': float(parts[3]) if parts[3] and parts[3] != 'N/A' else 0,
-                            'fanPercent': 0,  # Would need additional parsing
-                            'driverVersion': 'Unknown'
-                        }
-                        gpus.append(gpu_data)
-                    except (ValueError, IndexError) as e:
-                        logger.warning(f"Failed to parse AMD GPU data: {line} - {e}")
-                        continue
-
-            logger.debug(f"Collected {len(gpus)} AMD GPU metrics")
-            return gpus
-
-        except subprocess.TimeoutExpired:
-            logger.error("rocm-smi command timed out")
-            return []
-        except FileNotFoundError:
-            logger.debug("rocm-smi not found")
-            return []
-        except Exception as e:
-            logger.error(f"Error collecting AMD metrics: {e}")
-            return []
+    def get_network_rates(self) -> Dict[str, float]:
+        counters = psutil.net_io_counters()
+        now = time.monotonic()
+        rates = {}
+        if self._last_net:
+            last_counters, last_time = self._last_net
+            elapsed = max(now - last_time, 0.001)
+            rates = {
+                "netRxBps": max(0, (counters.bytes_recv - last_counters.bytes_recv) / elapsed),
+                "netTxBps": max(0, (counters.bytes_sent - last_counters.bytes_sent) / elapsed),
+            }
+        self._last_net = (counters, now)
+        return rates
 
     def get_system_metrics(self) -> Dict[str, Any]:
-        """Collect system metrics using psutil."""
+        memory = psutil.virtual_memory()
         try:
-            # CPU usage
-            cpu_percent = psutil.cpu_percent(interval=1)
-            
-            # Memory usage
-            memory = psutil.virtual_memory()
-            ram_percent = memory.percent
-            
-            # Disk usage (root partition)
-            disk = psutil.disk_usage('/')
-            disk_percent = disk.percent
-            
-            # Load average (Unix-like systems)
-            try:
-                load_avg = os.getloadavg()[0]  # 1-minute load average
-            except (OSError, AttributeError):
-                load_avg = 0.0  # Windows doesn't have load average
-            
-            # Uptime
-            boot_time = psutil.boot_time()
-            uptime_sec = int(time.time() - boot_time)
-            
-            return {
-                'cpuPercent': round(cpu_percent, 2),
-                'ramPercent': round(ram_percent, 2),
-                'diskPercent': round(disk_percent, 2),
-                'load1': round(load_avg, 2),
-                'uptimeSec': uptime_sec
+            disk = psutil.disk_usage(self.disk_path)
+            disk_metrics = {
+                "diskPercent": round(disk.percent, 2),
+                "diskUsedGB": round(disk.used / 1024 ** 3, 2),
+                "diskTotalGB": round(disk.total / 1024 ** 3, 2),
             }
-            
-        except Exception as e:
-            logger.error(f"Error collecting system metrics: {e}")
-            return {
-                'cpuPercent': 0,
-                'ramPercent': 0,
-                'diskPercent': 0,
-                'load1': 0,
-                'uptimeSec': 0
-            }
+        except OSError as e:
+            logger.warning("Cannot read disk usage of %s: %s", self.disk_path, e)
+            disk_metrics = {"diskPercent": 0}
+        try:
+            load1, load5, load15 = os.getloadavg()
+        except (OSError, AttributeError):
+            load1 = load5 = load15 = 0.0
 
-    def collect_metrics(self) -> Dict[str, Any]:
-        """Collect all metrics and format for API submission."""
-        # Collect GPU metrics from both vendors
-        nvidia_gpus = self.get_nvidia_metrics()
-        amd_gpus = self.get_amd_metrics()
-        all_gpus = nvidia_gpus + amd_gpus
-        
-        # Collect system metrics
-        sys_metrics = self.get_system_metrics()
-        
-        # Format payload
-        payload = {
-            'server': {
-                'id': self.server_id,
-                'name': self.server_name,
-                'tags': self.tags
-            },
-            'sys': sys_metrics,
-            'gpus': all_gpus,
-            'ts': datetime.utcnow().isoformat() + 'Z'
+        return {
+            "cpuPercent": round(psutil.cpu_percent(interval=None), 2),
+            "ramPercent": round(memory.percent, 2),
+            "ramUsedMB": round((memory.total - memory.available) / 1024 ** 2),
+            "ramTotalMB": round(memory.total / 1024 ** 2),
+            **disk_metrics,
+            "load1": round(load1, 2),
+            "load5": round(load5, 2),
+            "load15": round(load15, 2),
+            "uptimeSec": int(time.time() - psutil.boot_time()),
+            **{k: round(v) for k, v in self.get_network_rates().items()},
         }
-        
-        logger.debug(f"Collected metrics: {len(all_gpus)} GPUs, system metrics")
-        return payload
 
-    def send_metrics(self, payload: Dict[str, Any]) -> bool:
-        """Send metrics to the central API."""
+    def collect(self) -> Dict[str, Any]:
+        return {
+            "server": {"id": self.server_id, "name": self.server_name, "tags": self.tags},
+            "host": self.host,
+            "sys": self.get_system_metrics(),
+            "gpus": get_nvidia_metrics() + get_amd_metrics(),
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def send(self, payload: Dict[str, Any]) -> Optional[bool]:
+        """True = accepted, False = retry later, None = rejected for good (drop it)."""
         try:
-            headers = {
-                'Content-Type': 'application/json',
-                'x-api-key': self.api_key
-            }
-            
-            url = f"{self.api_url.rstrip('/')}/v1/ingest"
-            
-            response = requests.post(
-                url,
-                json=payload,
-                headers=headers,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                logger.debug("Metrics sent successfully")
-                return True
-            else:
-                logger.error(f"API returned status {response.status_code}: {response.text}")
+            response = self.session.post(f"{self.api_url}/v1/ingest", data=json.dumps(payload), timeout=15)
+        except requests.RequestException as e:
+            logger.warning("Cannot reach %s: %s", self.api_url, e.__class__.__name__)
+            return False
+        if response.ok:
+            return True
+        if response.status_code in (401, 403):
+            logger.error("API rejected the key (%s): %s", response.status_code, response.text[:200])
+            return False
+        if response.status_code == 400:
+            logger.error("API rejected the payload: %s", response.text[:500])
+            return None
+        logger.warning("API returned %s: %s", response.status_code, response.text[:200])
+        return False
+
+    def flush(self) -> bool:
+        """Send the newest report first, then the backlog. Returns True if all went through."""
+        while self.buffer:
+            result = self.send(self.buffer[-1])
+            if result is False:
                 return False
-                
-        except requests.exceptions.Timeout:
-            logger.error("Request timed out")
-            return False
-        except requests.exceptions.ConnectionError:
-            logger.error("Connection error - is the API server running?")
-            return False
-        except Exception as e:
-            logger.error(f"Error sending metrics: {e}")
-            return False
+            self.buffer.pop()
+        return True
 
-    def run(self):
-        """Main collection loop."""
-        logger.info("Starting metrics collection...")
-        
-        consecutive_failures = 0
-        max_failures = 10
-        
-        while True:
+    def heartbeat(self) -> None:
+        try:
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(str(time.time()))
+        except OSError:
+            pass
+
+    def run(self) -> None:
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        failures = 0
+        next_run = time.monotonic()
+
+        while self._running:
             try:
-                # Collect metrics
-                payload = self.collect_metrics()
-                
-                # Send to API
-                success = self.send_metrics(payload)
-                
-                if success:
-                    consecutive_failures = 0
-                    logger.info(f"Metrics collected and sent for server {self.server_id}")
+                self.buffer.append(self.collect())
+                if self.flush():
+                    if failures:
+                        logger.info("Connection restored after %d failed attempts", failures)
+                    failures = 0
+                    self.heartbeat()
+                    logger.debug("Report sent")
                 else:
-                    consecutive_failures += 1
-                    logger.warning(f"Failed to send metrics ({consecutive_failures}/{max_failures})")
-                    
-                    if consecutive_failures >= max_failures:
-                        logger.error(f"Too many consecutive failures ({max_failures}), exiting")
-                        sys.exit(1)
-                
-                # Wait for next collection
-                time.sleep(self.interval)
-                
-            except KeyboardInterrupt:
-                logger.info("Received interrupt signal, shutting down...")
-                break
-            except Exception as e:
-                logger.error(f"Unexpected error in main loop: {e}")
-                consecutive_failures += 1
-                if consecutive_failures >= max_failures:
-                    logger.error("Too many consecutive errors, exiting")
-                    sys.exit(1)
-                time.sleep(self.interval)
+                    failures += 1
+                    logger.warning("Report kept in buffer (%d pending)", len(self.buffer))
+            except Exception:  # never let one bad sample kill the agent
+                logger.exception("Unexpected error during collection")
 
-def main():
-    """Entry point."""
+            next_run += self.interval
+            # Back off a little when the API is down, without drifting forever
+            delay = max(0.0, next_run - time.monotonic()) + min(failures, 10) * 3
+            end = time.monotonic() + delay
+            while self._running and time.monotonic() < end:
+                time.sleep(min(1.0, end - time.monotonic()))
+            if time.monotonic() > next_run + self.interval:
+                next_run = time.monotonic()
+
+
+def main() -> None:
     collector = MetricsCollector()
+    if "--dry-run" in sys.argv:
+        time.sleep(1)  # let CPU and network counters accumulate
+        print(json.dumps(collector.collect(), indent=2))
+        return
+    if "--once" in sys.argv:
+        time.sleep(1)
+        ok = collector.send(collector.collect())
+        print("OK" if ok else "FAILED")
+        sys.exit(0 if ok else 1)
     collector.run()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()

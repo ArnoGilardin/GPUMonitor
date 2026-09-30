@@ -4,3 +4,7 @@ dist
 server/public
 vite.config.ts.*
 *.tar.gz
+test-results
+playwright-report
+__pycache__
+.env

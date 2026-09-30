@@ -1,118 +1,35 @@
+import type { Alert, Rule, RuleType, Server } from "@shared/schema";
 import { storage } from "./storage";
-import { sendEmail } from "./sendgrid.ts";
+import { sendEmail } from "./sendgrid";
+import { events } from "./services/events";
+import { BreachTracker, alertMessage, metricValue, ruleAppliesTo, type LatestSample } from "./services/rules-engine";
 
-interface AlertCheck {
-  ruleId: string;
-  serverId: string;
-  value: number;
-  threshold: number;
-  level: "warning" | "critical";
-  message: string;
-}
+const tracker = new BreachTracker();
 
-export async function checkAlerts(serverId: string) {
+/** Evaluate every metric rule for one server right after it reported. */
+export async function checkAlerts(server: Server, sample: LatestSample): Promise<void> {
   try {
-    const rules = await storage.getActiveRules();
-    const latestMetrics = await storage.getLatestMetrics(serverId);
-    
-    if (!latestMetrics) {
-      return;
-    }
+    const activeRules = await storage.getActiveRules();
 
-    const alertChecks: AlertCheck[] = [];
+    for (const rule of activeRules) {
+      if (!ruleAppliesTo(rule, server)) continue;
+      const key = `${server.id}:${rule.id}`;
 
-    for (const rule of rules) {
-      let value: number | undefined;
-      let message: string = "";
-
-      switch (rule.type) {
-        case "gpu_temp":
-          if (latestMetrics.gpuSnapshots.length > 0) {
-            const maxTemp = Math.max(...latestMetrics.gpuSnapshots.map((g: any) => parseFloat(g.tempC || "0")));
-            value = maxTemp;
-            message = `GPU temperature reached ${maxTemp}°C, exceeding threshold of ${rule.threshold}°C`;
-          }
-          break;
-        
-        case "gpu_util":
-          if (latestMetrics.gpuSnapshots.length > 0) {
-            const avgUtil = latestMetrics.gpuSnapshots.reduce((sum: number, g: any) => sum + parseFloat(g.utilPercent || "0"), 0) / latestMetrics.gpuSnapshots.length;
-            value = avgUtil;
-            message = `GPU utilization reached ${avgUtil.toFixed(1)}%, exceeding threshold of ${rule.threshold}%`;
-          }
-          break;
-        
-        case "vram_util":
-          if (latestMetrics.gpuSnapshots.length > 0) {
-            const avgVramUtil = latestMetrics.gpuSnapshots.reduce((sum: number, g: any) => {
-              const used = g.vramUsedMB || 0;
-              const total = g.vramTotalMB || 1;
-              return sum + (used / total) * 100;
-            }, 0) / latestMetrics.gpuSnapshots.length;
-            value = avgVramUtil;
-            message = `VRAM utilization reached ${avgVramUtil.toFixed(1)}%, exceeding threshold of ${rule.threshold}%`;
-          }
-          break;
-        
-        case "cpu_util":
-          if (latestMetrics.sysSnapshot) {
-            value = parseFloat(latestMetrics.sysSnapshot.cpuPercent || "0");
-            message = `CPU utilization reached ${value}%, exceeding threshold of ${rule.threshold}%`;
-          }
-          break;
-        
-        case "disk_util":
-          if (latestMetrics.sysSnapshot) {
-            value = parseFloat(latestMetrics.sysSnapshot.diskPercent || "0");
-            message = `Disk utilization reached ${value}%, exceeding threshold of ${rule.threshold}%`;
-          }
-          break;
+      if (rule.type === "server_offline") {
+        // The server just reported, so any offline alert is over
+        tracker.update(key, false, 0);
+        await resolveIfActive(server, rule, "auto");
+        continue;
       }
 
-      if (value !== undefined && value >= parseFloat(rule.threshold)) {
-        alertChecks.push({
-          ruleId: rule.id,
-          serverId,
-          value,
-          threshold: parseFloat(rule.threshold),
-          level: rule.level as "warning" | "critical",
-          message,
-        });
-      }
-    }
+      const value = metricValue(rule.type as RuleType, sample);
+      const breached = value !== undefined && value >= Number(rule.threshold);
+      const decision = server.maintenance ? "clear" : tracker.update(key, breached, rule.durationSec);
 
-    // Process alerts atomically to prevent duplicates
-    for (const check of alertChecks) {
-      try {
-        const existingAlert = await storage.getActiveAlert(serverId, check.ruleId);
-        
-        if (!existingAlert) {
-          // Check if the condition has been true for the required duration
-          const rule = rules.find(r => r.id === check.ruleId);
-          if (rule) {
-            const shouldFire = await storage.checkAlertDuration(serverId, check.ruleId, rule.durationSec);
-            
-            if (shouldFire) {
-              // Fire alert (atomic operation)
-              const newAlert = await storage.createAlert({
-                serverId,
-                ruleId: check.ruleId,
-                level: check.level,
-                message: check.message,
-              });
-
-              // Send notifications (non-blocking, catch errors)
-              sendNotifications(check, latestMetrics.server.name)
-                .catch(err => {
-                  console.error(`Failed to send notifications for alert ${newAlert.id}:`, err);
-                  // Log to audit trail or metrics system
-                });
-            }
-          }
-        }
-      } catch (alertError) {
-        console.error(`Failed to process alert for rule ${check.ruleId}:`, alertError);
-        // Continue processing other alerts
+      if (decision === "fire" && value !== undefined) {
+        await fireIfNew(server, rule, value);
+      } else if (decision === "clear") {
+        await resolveIfActive(server, rule, "auto");
       }
     }
   } catch (error) {
@@ -120,84 +37,157 @@ export async function checkAlerts(serverId: string) {
   }
 }
 
-async function sendNotifications(alert: AlertCheck, serverName: string) {
-  const errors: string[] = [];
-  
+/** Periodic check for servers that stopped reporting. */
+export async function checkOfflineServers(): Promise<void> {
   try {
-    const settings = await storage.getSettings();
-    const emailTo = settings.find(s => s.key === "alert_email_to")?.value;
-    const webhookUrl = settings.find(s => s.key === "webhook_url")?.value;
+    const offlineRules = (await storage.getActiveRules()).filter((r) => r.type === "server_offline");
+    if (!offlineRules.length) return;
+    const serverList = await storage.listServers();
+    const now = Date.now();
 
-    // Send email notification
-    if (emailTo && process.env.SENDGRID_API_KEY) {
-      try {
-        const subject = `${alert.level.toUpperCase()} Alert: ${serverName}`;
-        const html = `
-          <h2>Server Monitor Alert</h2>
-          <p><strong>Server:</strong> ${serverName}</p>
-          <p><strong>Level:</strong> ${alert.level.toUpperCase()}</p>
-          <p><strong>Message:</strong> ${alert.message}</p>
-          <p><strong>Threshold:</strong> ${alert.threshold}</p>
-          <p><strong>Current Value:</strong> ${alert.value}</p>
-          <p><strong>Time:</strong> ${new Date().toISOString()}</p>
-        `;
-
-        const emailSent = await sendEmail(process.env.SENDGRID_API_KEY, {
-          to: emailTo,
-          from: process.env.SENDGRID_FROM_EMAIL || "alerts@gpu-monitor.com",
-          subject,
-          html,
-        });
-        
-        if (!emailSent) {
-          errors.push(`Email notification failed for ${emailTo}`);
-        } else {
-          console.log(`✅ Alert email sent to ${emailTo}`);
+    for (const server of serverList) {
+      if (!server.lastSeenAt || server.maintenance) continue;
+      const silentSec = (now - new Date(server.lastSeenAt).getTime()) / 1000;
+      for (const rule of offlineRules) {
+        if (!ruleAppliesTo(rule, server)) continue;
+        if (silentSec >= Number(rule.threshold)) {
+          await fireIfNew(server, rule, silentSec);
         }
-      } catch (emailError) {
-        const errorMsg = `Email notification error: ${emailError}`;
-        errors.push(errorMsg);
-        console.error(errorMsg);
       }
-    }
-
-    // Send webhook notification
-    if (webhookUrl) {
-      try {
-        const response = await fetch(webhookUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            server: serverName,
-            level: alert.level,
-            message: alert.message,
-            threshold: alert.threshold,
-            value: alert.value,
-            timestamp: new Date().toISOString(),
-          }),
-        });
-        
-        if (!response.ok) {
-          errors.push(`Webhook notification failed with status ${response.status}`);
-        } else {
-          console.log(`✅ Alert webhook sent to ${webhookUrl}`);
-        }
-      } catch (webhookError) {
-        const errorMsg = `Webhook notification error: ${webhookError}`;
-        errors.push(errorMsg);
-        console.error(errorMsg);
-      }
-    }
-    
-    // Log any errors that occurred
-    if (errors.length > 0) {
-      console.error(`⚠️ Notification errors for ${serverName}:`, errors);
-      throw new Error(errors.join("; "));
     }
   } catch (error) {
-    console.error("Notification sending error:", error);
-    throw error; // Re-throw to be caught by caller
+    console.error("Offline check error:", error);
   }
+}
+
+export function forgetServer(serverId: string) {
+  tracker.forgetServer(serverId);
+}
+
+async function fireIfNew(server: Server, rule: Rule, value: number) {
+  const existing = await storage.getActiveAlert(server.id, rule.id);
+  if (existing) return;
+
+  const message = alertMessage(rule, value);
+  const alert = await storage.createAlert({
+    serverId: server.id,
+    ruleId: rule.id,
+    level: rule.level,
+    message,
+    value: value.toFixed(2),
+  });
+  events.emitEvent({ type: "alert", action: "fired", alertId: alert.id, serverId: server.id, level: alert.level, message, serverName: server.name });
+
+  sendNotifications({ kind: "fired", alert, rule, serverName: server.name }).catch((err) =>
+    console.error(`Failed to send notifications for alert ${alert.id}:`, err.message),
+  );
+}
+
+async function resolveIfActive(server: Server, rule: Rule, by: string) {
+  const existing = await storage.getActiveAlert(server.id, rule.id);
+  if (!existing) return;
+  const resolved = await storage.resolveAlert(existing.id, by);
+  if (!resolved) return;
+  events.emitEvent({ type: "alert", action: "resolved", alertId: resolved.id, serverId: server.id, level: resolved.level, message: resolved.message, serverName: server.name });
+
+  const settings = await storage.getSettings();
+  if (settings.notify_on_resolve === "true") {
+    sendNotifications({ kind: "resolved", alert: resolved, rule, serverName: server.name }).catch((err) =>
+      console.error(`Failed to send resolve notification for alert ${resolved.id}:`, err.message),
+    );
+  }
+}
+
+// --------------------------------------------------------------- notifications
+
+export interface NotificationPayload {
+  kind: "fired" | "resolved" | "test";
+  alert: Pick<Alert, "level" | "message" | "value" | "firedAt">;
+  rule?: Pick<Rule, "name" | "threshold">;
+  serverName: string;
+}
+
+/** Build a webhook body adapted to the destination (Slack, Discord or generic JSON). */
+export function buildWebhookBody(url: string, n: NotificationPayload): unknown {
+  const emoji = n.kind === "resolved" ? "✅" : n.alert.level === "critical" ? "🔴" : "🟠";
+  const title = n.kind === "resolved"
+    ? `Resolved: ${n.rule?.name ?? "alert"} on ${n.serverName}`
+    : `${n.alert.level.toUpperCase()}: ${n.rule?.name ?? "alert"} on ${n.serverName}`;
+  const text = `${emoji} *${title}*\n${n.alert.message}`;
+
+  if (url.includes("hooks.slack.com")) {
+    return { text };
+  }
+  if (url.includes("discord.com/api/webhooks") || url.includes("discordapp.com/api/webhooks")) {
+    return {
+      embeds: [{
+        title: `${emoji} ${title}`,
+        description: n.alert.message,
+        color: n.kind === "resolved" ? 0x22c55e : n.alert.level === "critical" ? 0xef4444 : 0xf59e0b,
+        timestamp: new Date().toISOString(),
+      }],
+    };
+  }
+  return {
+    event: n.kind,
+    server: n.serverName,
+    level: n.alert.level,
+    rule: n.rule?.name,
+    message: n.alert.message,
+    threshold: n.rule ? Number(n.rule.threshold) : undefined,
+    value: n.alert.value !== null && n.alert.value !== undefined ? Number(n.alert.value) : undefined,
+    text,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+export async function sendWebhook(url: string, n: NotificationPayload): Promise<void> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(buildWebhookBody(url, n)),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    throw new Error(`Webhook returned HTTP ${response.status}`);
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+export async function sendAlertEmail(to: string, n: NotificationPayload): Promise<void> {
+  if (!process.env.SENDGRID_API_KEY) {
+    throw new Error("SENDGRID_API_KEY is not configured");
+  }
+  const subject = n.kind === "resolved"
+    ? `[RESOLVED] ${n.serverName}: ${n.rule?.name ?? "alert"}`
+    : `[${n.alert.level.toUpperCase()}] ${n.serverName}: ${n.rule?.name ?? "alert"}`;
+  const html = `
+    <h2>GPU Monitor ${n.kind === "resolved" ? "- alert resolved" : "alert"}</h2>
+    <p><strong>Server:</strong> ${escapeHtml(n.serverName)}</p>
+    <p><strong>Level:</strong> ${escapeHtml(n.alert.level.toUpperCase())}</p>
+    <p><strong>Message:</strong> ${escapeHtml(n.alert.message)}</p>
+    <p><strong>Time:</strong> ${new Date().toISOString()}</p>`;
+  const ok = await sendEmail(process.env.SENDGRID_API_KEY, {
+    to,
+    from: process.env.SENDGRID_FROM_EMAIL || "alerts@gpu-monitor.local",
+    subject,
+    html,
+  });
+  if (!ok) throw new Error(`Email to ${to} failed`);
+}
+
+async function sendNotifications(n: NotificationPayload): Promise<void> {
+  const settings = await storage.getSettings();
+  const errors: string[] = [];
+
+  if (settings.alert_email_to && process.env.SENDGRID_API_KEY) {
+    await sendAlertEmail(settings.alert_email_to, n).catch((e) => errors.push(e.message));
+  }
+  if (settings.webhook_url) {
+    await sendWebhook(settings.webhook_url, n).catch((e) => errors.push(e.message));
+  }
+  if (errors.length) throw new Error(errors.join("; "));
 }

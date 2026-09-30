@@ -1,24 +1,16 @@
-version: '3.8'
-
+# Collector for one GPU server. Copy .env.example to .env and fill it in, then:
+#   docker compose up -d                        # NVIDIA server (needs NVIDIA Container Toolkit)
+#   docker compose --profile cpu-only up -d cpu-collector   # server without GPU
 services:
-  # GPU-enabled collector (requires NVIDIA Container Toolkit)
   gpu-collector:
     build: .
+    image: gpu-monitor-collector:latest
     container_name: gpu-monitor-collector
     restart: unless-stopped
-    environment:
-      # REQUIRED: Set these in .env file
-      - CENTRAL_API_URL=${CENTRAL_API_URL}
-      - CENTRAL_API_KEY=${CENTRAL_API_KEY}
-      - SERVER_ID=${SERVER_ID}
-      - SERVER_NAME=${SERVER_NAME}
-      - SERVER_TAGS=${SERVER_TAGS:-gpu}
-      - INTERVAL_SEC=${INTERVAL_SEC:-30}
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /dev:/host/dev:ro
-    privileged: true
+    env_file: .env
+    # host network/pid: report the host's hostname, network traffic and load
+    network_mode: host
+    pid: host
     deploy:
       resources:
         reservations:
@@ -26,34 +18,14 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    network_mode: host
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
-    
-  # Alternative service without GPU access for CPU-only servers
+
   cpu-collector:
     build: .
+    image: gpu-monitor-collector:latest
     container_name: gpu-monitor-collector-cpu
     restart: unless-stopped
-    environment:
-      # REQUIRED: Set these in .env file
-      - CENTRAL_API_URL=${CENTRAL_API_URL}
-      - CENTRAL_API_KEY=${CENTRAL_API_KEY}
-      - SERVER_ID=${SERVER_ID}
-      - SERVER_NAME=${SERVER_NAME}
-      - SERVER_TAGS=${SERVER_TAGS:-cpu-only}
-      - INTERVAL_SEC=${INTERVAL_SEC:-30}
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
+    env_file: .env
     network_mode: host
-    healthcheck:
-      test: ["CMD", "python3", "-c", "import sys; sys.exit(0)"]
-      interval: 60s
-      timeout: 10s
-      retries: 3
+    pid: host
     profiles:
       - cpu-only

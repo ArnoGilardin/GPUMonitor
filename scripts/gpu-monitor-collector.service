@@ -1,27 +1,26 @@
 [Unit]
 Description=GPU Monitor Collector
-After=network.target
-Wants=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
+User=gpu-monitor
+Group=gpu-monitor
 Environment=PYTHONUNBUFFERED=1
+Environment=HEARTBEAT_FILE=/run/gpu-monitor-collector/heartbeat
 EnvironmentFile=/etc/gpu-monitor/collector.env
-ExecStart=/usr/local/bin/gpu-monitor-collector
+ExecStart=/opt/gpu-monitor-collector/venv/bin/python /opt/gpu-monitor-collector/collector.py
 Restart=always
 RestartSec=10
-StandardOutput=journal
-StandardError=journal
+RuntimeDirectory=gpu-monitor-collector
 SyslogIdentifier=gpu-monitor-collector
 
-# Security settings
+# Hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

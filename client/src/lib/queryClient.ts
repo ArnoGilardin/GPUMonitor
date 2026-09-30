@@ -1,28 +1,50 @@
 import { QueryClient, QueryFunction } from "@tanstack/react-query";
 
-async function throwIfResNotOk(res: Response) {
-  if (!res.ok) {
-    const text = (await res.text()) || res.statusText;
-    throw new Error(`${res.status}: ${text}`);
+const TOKEN_KEY = "auth_token";
+const REFRESH_KEY = "auth_refresh_token";
+const USER_KEY = "auth_user";
+
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
   }
 }
 
-// Flag to prevent multiple simultaneous refresh attempts
-let isRefreshing = false;
+async function throwIfResNotOk(res: Response) {
+  if (!res.ok) {
+    let message = res.statusText;
+    try {
+      const text = await res.text();
+      try {
+        message = JSON.parse(text).message || text;
+      } catch {
+        message = text || message;
+      }
+    } catch {
+      // keep statusText
+    }
+    throw new ApiError(res.status, message);
+  }
+}
+
+export function getAccessToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+export function clearSession() {
+  localStorage.removeItem(TOKEN_KEY);
+  localStorage.removeItem(REFRESH_KEY);
+  localStorage.removeItem(USER_KEY);
+  window.dispatchEvent(new Event("auth:logout"));
+}
+
+// Single in-flight refresh shared by all callers
 let refreshPromise: Promise<string | null> | null = null;
 
-async function refreshAccessTokenIfNeeded(): Promise<string | null> {
-  if (isRefreshing) {
-    return refreshPromise;
-  }
-
-  isRefreshing = true;
-  const refreshToken = localStorage.getItem("auth_refresh_token");
-  
-  if (!refreshToken) {
-    isRefreshing = false;
-    return null;
-  }
+export function refreshAccessToken(): Promise<string | null> {
+  if (refreshPromise) return refreshPromise;
+  const refreshToken = localStorage.getItem(REFRESH_KEY);
+  if (!refreshToken) return Promise.resolve(null);
 
   refreshPromise = (async () => {
     try {
@@ -32,105 +54,81 @@ async function refreshAccessTokenIfNeeded(): Promise<string | null> {
         body: JSON.stringify({ refreshToken }),
         credentials: "include",
       });
-
-      if (!response.ok) {
-        throw new Error("Refresh failed");
-      }
-
+      if (!response.ok) throw new Error("Refresh failed");
       const data = await response.json();
-      const newAccessToken = data.token;
-      
-      localStorage.setItem("auth_token", newAccessToken);
-      return newAccessToken;
-    } catch (error) {
-      // Clear tokens on refresh failure
-      localStorage.removeItem("auth_token");
-      localStorage.removeItem("auth_refresh_token");
-      localStorage.removeItem("auth_user");
+      localStorage.setItem(TOKEN_KEY, data.token);
+      if (data.user) localStorage.setItem(USER_KEY, JSON.stringify(data.user));
+      window.dispatchEvent(new CustomEvent("auth:refreshed", { detail: data }));
+      return data.token as string;
+    } catch {
+      clearSession();
       return null;
     } finally {
-      isRefreshing = false;
       refreshPromise = null;
     }
   })();
-
   return refreshPromise;
 }
 
-export async function apiRequest(
-  method: string,
-  url: string,
-  data?: unknown | undefined,
-): Promise<Response> {
-  const makeRequest = async (accessToken?: string) => {
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    
-    if (accessToken) {
-      headers.Authorization = `Bearer ${accessToken}`;
-    }
-
-    return fetch(url, {
-      method,
-      headers: data ? headers : { Authorization: headers.Authorization || "" },
-      body: data ? JSON.stringify(data) : undefined,
+/** fetch with the bearer token, refreshing it once on 401. */
+async function authFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const send = (token: string | null) =>
+    fetch(url, {
+      ...init,
+      headers: { ...(init.headers || {}), ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       credentials: "include",
     });
-  };
 
-  // First attempt with current token
-  let token = localStorage.getItem("auth_token");
-  let res = await makeRequest(token || undefined);
-
-  // If 401 and we have a refresh token, try to refresh
-  if (res.status === 401 && localStorage.getItem("auth_refresh_token")) {
-    const newToken = await refreshAccessTokenIfNeeded();
-    if (newToken) {
-      // Retry with new token
-      res = await makeRequest(newToken);
-    }
+  let res = await send(getAccessToken());
+  if (res.status === 401 && localStorage.getItem(REFRESH_KEY) && !url.startsWith("/api/auth/")) {
+    const token = await refreshAccessToken();
+    if (token) res = await send(token);
   }
+  return res;
+}
 
+export async function apiRequest(method: string, url: string, data?: unknown): Promise<Response> {
+  const res = await authFetch(url, {
+    method,
+    headers: data !== undefined ? { "Content-Type": "application/json" } : {},
+    body: data !== undefined ? JSON.stringify(data) : undefined,
+  });
   await throwIfResNotOk(res);
   return res;
 }
 
+/** Download an authenticated file (e.g. CSV export). */
+export async function apiDownload(url: string, filename: string) {
+  const res = await authFetch(url);
+  await throwIfResNotOk(res);
+  const blob = await res.blob();
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(href);
+}
+
 type UnauthorizedBehavior = "returnNull" | "throw";
-export const getQueryFn: <T>(options: {
-  on401: UnauthorizedBehavior;
-}) => QueryFunction<T> =
+export const getQueryFn: <T>(options: { on401: UnauthorizedBehavior }) => QueryFunction<T> =
   ({ on401: unauthorizedBehavior }) =>
   async ({ queryKey }) => {
-    const makeQueryRequest = async (accessToken?: string) => {
-      const headers: Record<string, string> = {};
-      if (accessToken) {
-        headers.Authorization = `Bearer ${accessToken}`;
-      }
-
-      return fetch(queryKey.join("/") as string, {
-        headers,
-        credentials: "include",
-      });
-    };
-
-    // First attempt with current token
-    let token = localStorage.getItem("auth_token");
-    let res = await makeQueryRequest(token || undefined);
-
-    // If 401 and we have a refresh token, try to refresh
-    if (res.status === 401 && localStorage.getItem("auth_refresh_token")) {
-      const newToken = await refreshAccessTokenIfNeeded();
-      if (newToken) {
-        // Retry with new token
-        res = await makeQueryRequest(newToken);
-      }
+    // ["/api/servers", id, "metrics", { hours: 6 }] -> /api/servers/id/metrics?hours=6
+    const parts = queryKey.filter((k) => typeof k === "string" || typeof k === "number");
+    const params = queryKey.find((k) => k && typeof k === "object") as Record<string, unknown> | undefined;
+    let url = parts.join("/");
+    if (params) {
+      const qs = new URLSearchParams(
+        Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => [k, String(v)]),
+      ).toString();
+      if (qs) url += `?${qs}`;
     }
 
+    const res = await authFetch(url);
     if (unauthorizedBehavior === "returnNull" && res.status === 401) {
       return null;
     }
-
     await throwIfResNotOk(res);
     return await res.json();
   };
@@ -140,13 +138,10 @@ export const queryClient = new QueryClient({
     queries: {
       queryFn: getQueryFn({ on401: "throw" }),
       refetchInterval: false,
-      refetchOnWindowFocus: false,
-      staleTime: 5 * 60 * 1000, // 5 minutes
+      refetchOnWindowFocus: true,
+      staleTime: 10 * 1000,
       retry: (failureCount, error) => {
-        // Don't retry on 401/403 errors
-        if (error instanceof Error && (error.message.includes("401") || error.message.includes("403"))) {
-          return false;
-        }
+        if (error instanceof ApiError && [401, 403, 404].includes(error.status)) return false;
         return failureCount < 3;
       },
     },

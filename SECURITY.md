@@ -12,7 +12,6 @@ Before deploying to production, ensure you complete ALL the following steps:
 # Generate all required secrets
 openssl rand -hex 32  # For JWT_SECRET
 openssl rand -hex 32  # For REFRESH_TOKEN_SECRET  
-openssl rand -hex 32  # For SESSION_SECRET
 openssl rand -hex 24  # For COLLECTOR_API_KEY
 openssl rand -base64 32  # For POSTGRES_PASSWORD
 ```
@@ -88,9 +87,8 @@ sudo ufw enable
 ```
 
 **DO NOT expose:**
-- Port 5100 (application - behind reverse proxy only)
+- Port 5100 (application - published on 127.0.0.1 only, put a reverse proxy in front)
 - Port 5432 (PostgreSQL - Docker internal only)
-- Port 6379 (Redis - Docker internal only)
 
 ### 7. Collector Security
 
@@ -211,11 +209,15 @@ If you suspect a security breach:
 - JWT tokens with refresh mechanism
 - Bcrypt password hashing (12 rounds)
 - Role-based access control (admin/viewer)
-- Session management with Redis
+- Refresh tokens stored server-side and revocable (logout, password reset)
+- Public registration disabled by default (`ALLOW_REGISTRATION`)
+- Secrets required at startup in production
 
 ✅ **API Security:**
-- Rate limiting (100 req/15min general, 120 req/min for ingestion)
-- API key authentication for collectors
+- Rate limiting (3000 req/15min per IP on /api, 120 req/min per collector key and IP)
+- Per-server collector keys (SHA-256 hashed, shown once, rotatable); a keyed server
+  refuses the global key, and `REQUIRE_SERVER_KEYS=true` disables the global key entirely
+- Constant-time key comparison, input validation with zod on every endpoint
 - CORS protection
 - Helmet security headers
 - Input validation (Zod schemas)

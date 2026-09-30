@@ -1,53 +1,37 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from "@playwright/test";
+import { login } from "./helpers";
 
-test.describe('Dashboard Functionality', () => {
-  test.beforeEach(async ({ page }) => {
-    // Login before each test
-    await page.goto('/');
-    await page.fill('[data-testid="input-username"]', 'admin');
-    await page.fill('[data-testid="input-password"]', 'admin');
-    await page.click('[data-testid="login-button"]');
-    await expect(page).toHaveURL('/dashboard');
+test.describe("Dashboard", () => {
+  test.beforeEach(async ({ page }) => login(page));
+
+  test("shows fleet statistics", async ({ page }) => {
+    for (const id of ["stat-online", "stat-total-gpus", "stat-avg-gpu-util", "stat-total-power", "stat-critical-alerts"]) {
+      await expect(page.locator(`[data-testid="${id}"]`)).toBeVisible();
+    }
+    await expect(page.locator('[data-testid="stat-avg-gpu-util"]')).toHaveText(/\d+%/);
   });
 
-  test('should display dashboard with stats cards', async ({ page }) => {
-    // Verify stats cards are present
-    await expect(page.locator('[data-testid="stat-total-cpus"]')).toBeVisible();
-    await expect(page.locator('[data-testid="stat-avg-gpu-util"]')).toBeVisible();
-    await expect(page.locator('[data-testid="stat-critical-alerts"]')).toBeVisible();
-    await expect(page.locator('[data-testid="stat-power-usage"]')).toBeVisible();
-    
-    // Verify stats show numeric values
-    const totalCpus = await page.locator('[data-testid="stat-total-cpus"]').textContent();
-    const avgGpuUtil = await page.locator('[data-testid="stat-avg-gpu-util"]').textContent();
-    
-    expect(totalCpus).toMatch(/\d+/);
-    expect(avgGpuUtil).toMatch(/\d+%/);
-  });
-
-  test('should display servers section', async ({ page }) => {
+  test("lists servers and filters them", async ({ page }) => {
     await expect(page.locator('[data-testid="section-servers"]')).toBeVisible();
-    
-    // Should show filter tabs
-    await expect(page.locator('text=All')).toBeVisible();
-    await expect(page.locator('text=Online')).toBeVisible();
-    await expect(page.locator('text=Warning')).toBeVisible();
-    await expect(page.locator('text=Critical')).toBeVisible();
+    const cards = page.locator('[data-testid^="server-card-"]');
+    await expect(cards.first()).toBeVisible();
+    await page.click('[data-testid="filter-offline"]');
+    await page.click('[data-testid="filter-all"]');
+    await expect(cards.first()).toBeVisible();
   });
 
-  test('should display alerts section', async ({ page }) => {
-    await expect(page.locator('[data-testid="section-alerts"]')).toBeVisible();
-    await expect(page.locator('text=Recent Alerts')).toBeVisible();
+  test("searches from the header", async ({ page }) => {
+    await page.fill('[data-testid="search-input"]', "zzz-no-such-server");
+    await page.press('[data-testid="search-input"]', "Enter");
+    await expect(page.getByText("No server matches these filters")).toBeVisible();
+    await page.click('[data-testid="clear-search"]');
+    await expect(page.locator('[data-testid^="server-card-"]').first()).toBeVisible();
   });
 
-  test('should display navigation sidebar', async ({ page }) => {
-    await expect(page.locator('[data-testid="nav-dashboard"]')).toBeVisible();
-    await expect(page.locator('[data-testid="nav-alerts"]')).toBeVisible();
-    await expect(page.locator('[data-testid="nav-settings"]')).toBeVisible();
-  });
-
-  test('should display user info in header', async ({ page }) => {
-    await expect(page.locator('[data-testid="text-username"]')).toContainText('admin');
-    await expect(page.locator('[data-testid="button-logout"]')).toBeVisible();
+  test("opens server details with real charts", async ({ page }) => {
+    await page.locator('[data-testid^="server-card-"]').first().click();
+    await expect(page.locator('[data-testid="gpu-details-table"]')).toBeVisible();
+    await page.getByRole("radio", { name: "6h" }).click();
+    await expect(page.locator(".recharts-surface").first()).toBeVisible();
   });
 });
