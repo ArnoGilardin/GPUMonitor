@@ -10,6 +10,7 @@ import { Cpu, Server as ServerIcon, Zap, AlertTriangle, Activity, MemoryStick, P
 import ServerCard from "@/components/server-card";
 import AlertItem, { type AlertView } from "@/components/alert-item";
 import Header from "@/components/layout/header";
+import MetricChart from "@/components/charts/metric-chart";
 import { useAuth } from "@/lib/auth";
 import { cn } from "@/lib/utils";
 import type { FleetStats, ServerView } from "@shared/schema";
@@ -62,6 +63,10 @@ export default function Dashboard() {
   const { data: servers, isLoading } = useQuery<ServerView[]>({ queryKey: ["/api/servers"], refetchInterval: 60000 });
   const { data: stats } = useQuery<FleetStats>({ queryKey: ["/api/stats"], refetchInterval: 60000 });
   const { data: tags = [] } = useQuery<string[]>({ queryKey: ["/api/tags"] });
+  const { data: fleetHistory = [] } = useQuery<Array<Record<string, number | string | null>>>({
+    queryKey: ["/api/fleet/history", { hours: 24 }],
+    refetchInterval: 300000,
+  });
   const { data: recentAlerts = [] } = useQuery<AlertView[]>({ queryKey: ["/api/alerts", { status: "active", limit: 5 }], refetchInterval: 60000 });
 
   const statusRank: Record<string, number> = { error: 0, warning: 1, offline: 2, online: 3, pending: 4, maintenance: 5 };
@@ -113,6 +118,18 @@ export default function Dashboard() {
             value={stats?.activeAlerts ?? 0}
             sub={`${stats?.criticalAlerts ?? 0} critical · ${stats?.resolvedToday ?? 0} resolved today`} />
         </div>
+
+        {fleetHistory.length > 1 && (
+          <Card data-testid="fleet-history">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">Fleet GPU utilization · last 24 h</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <MetricChart data={fleetHistory} rangeHours={24} height={160} domain={[0, 100]} unit="%" type="area"
+                series={[{ key: "util", label: "Avg GPU utilization", color: "var(--chart-1)" }]} />
+            </CardContent>
+          </Card>
+        )}
 
         <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3" data-testid="section-servers">
           <div className="flex flex-wrap items-center gap-2">

@@ -3,6 +3,7 @@ import { registerRoutes } from "./routes";
 import { setupVite, serveStatic, log } from "./vite";
 import { bootstrap, startBackgroundJobs, stopBackgroundJobs } from "./jobs";
 import { pool } from "./db";
+import { runMigrations } from "./migrate";
 
 const app = express();
 app.disable("x-powered-by");
@@ -32,9 +33,10 @@ app.use((req, res, next) => {
   }
 
   try {
+    if (process.env.DB_AUTO_MIGRATE !== "false") await runMigrations();
     await bootstrap();
   } catch (err: any) {
-    console.error("❌ Bootstrap failed (has the schema been applied? run `npm run db:push`):", err.message);
+    console.error("❌ Database setup failed:", err.message);
     process.exit(1);
   }
 

@@ -51,7 +51,7 @@ const ROLES = ["training", "inference", "render", "research"];
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const drift = (v: number, step: number, lo: number, hi: number) => clamp(v + (Math.random() - 0.5) * 2 * step, lo, hi);
 
-interface SimGpu { util: number; vramPct: number; temp: number; model: typeof GPU_MODELS[number] }
+interface SimGpu { util: number; vramPct: number; temp: number; model: typeof GPU_MODELS[number]; ecc: number }
 interface SimServer {
   id: string; name: string; tags: string[]; hot: boolean; cores: number;
   cpu: number; ram: number; disk: number; boot: number; gpus: SimGpu[];
@@ -77,9 +77,13 @@ const fleet: SimServer[] = Array.from({ length: SERVER_COUNT }, (_, i) => {
       vramPct: 30 + Math.random() * 50,
       temp: hot ? 86 : 55 + Math.random() * 15,
       model,
+      ecc: 0,
     })),
   };
 });
+
+const USERS = ["alice", "bob", "chen", "dupont", "ml-svc"];
+const JOBS = ["python3", "torchrun", "vllm", "blender", "ollama"];
 
 function tick(s: SimServer) {
   s.cpu = drift(s.cpu, 8, 2, 100);
@@ -116,6 +120,9 @@ function tick(s: SimServer) {
       netTxBps: Math.round(Math.random() * 150e6),
       uptimeSec: Math.round(Date.now() / 1000 - s.boot),
     },
+    processes: s.gpus.flatMap((g, i) => g.util > 15
+      ? [{ gpuIndex: i, pid: 10000 + i * 7 + s.id.length, name: JOBS[(i + s.cores) % JOBS.length], user: USERS[(i + s.id.length) % USERS.length], vramMB: Math.round((g.vramPct / 100) * g.model.vram * 0.95) }]
+      : []),
     gpus: s.gpus.map((g, i) => ({
       gpuIndex: i,
       vendor: g.model.vendor,
@@ -128,6 +135,17 @@ function tick(s: SimServer) {
       powerW: round(60 + (g.util / 100) * (g.model.tdp - 60) * (0.9 + Math.random() * 0.1)),
       fanPercent: round(clamp(20 + (g.temp - 40) * 1.5, 0, 100)),
       driverVersion: g.model.vendor === "nvidia" ? "550.54.15" : "6.7.0",
+      ...(g.model.vendor === "nvidia" ? {
+        memUtilPercent: round(g.util * 0.6),
+        smClockMHz: g.util > 5 ? Math.round(1700 + Math.random() * 280) : 210,
+        memClockMHz: g.util > 5 ? 2619 : 405,
+        pstate: g.util > 5 ? "P0" : "P8",
+        // 0x1 idle, 0x4 power cap, 0x40 HW thermal slowdown when running hot
+        throttleMask: g.util < 5 ? 0x1 : g.temp >= 88 ? 0x40 : g.util > 90 ? 0x4 : 0,
+        eccUncorrected: g.ecc,
+        pcieGen: 5,
+        pcieWidth: 16,
+      } : {}),
     })),
     ts: new Date().toISOString(),
   };

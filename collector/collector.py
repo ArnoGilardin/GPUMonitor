@@ -15,6 +15,9 @@ Environment:
   DISK_PATH         filesystem to report (default /)
   BUFFER_SIZE       reports kept in memory while the API is unreachable (default 120)
   LOG_LEVEL         DEBUG, INFO, WARNING... (default INFO)
+  REPORT_PROCESSES  report processes using the GPUs (default true)
+  REPORT_CMDLINE    report full command lines instead of process names (default false;
+                    command lines can contain secrets)
 
 Usage:
   python3 collector.py            run forever
@@ -38,7 +41,7 @@ from typing import Any, Dict, List, Optional
 import psutil
 import requests
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 HEARTBEAT_FILE = os.getenv("HEARTBEAT_FILE", "/tmp/gpu-monitor-collector.heartbeat")
 
 logging.basicConfig(
@@ -114,13 +117,124 @@ def parse_nvidia_smi(output: str) -> List[Dict[str, Any]]:
     return gpus
 
 
+# Optional fields: some drivers or GPUs do not know them, so they are queried
+# separately and dropped if nvidia-smi refuses the query.
+EXTENDED_FIELDS = [
+    "index", "utilization.memory", "clocks.sm", "clocks.mem", "pstate",
+    "clocks_throttle_reasons.active", "ecc.errors.uncorrected.volatile.total",
+    "pcie.link.gen.current", "pcie.link.width.current",
+]
+# Renamed in recent drivers
+THROTTLE_FIELD_ALIASES = ["clocks_throttle_reasons.active", "clocks_event_reasons.active"]
+
+
+def to_int(value: Any) -> Optional[int]:
+    s = str(value).strip() if value is not None else ""
+    if s in NA_VALUES:
+        return None
+    try:
+        return int(s, 16) if s.lower().startswith("0x") else int(float(s))
+    except ValueError:
+        return None
+
+
+def parse_nvidia_extended(output: str) -> Dict[int, Dict[str, Any]]:
+    """Map GPU index -> advanced metrics (only the values that were reported)."""
+    result: Dict[int, Dict[str, Any]] = {}
+    for line in output.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < len(EXTENDED_FIELDS):
+            continue
+        index = to_int(parts[0])
+        if index is None:
+            continue
+        values = {
+            "memUtilPercent": None if parts[1] in NA_VALUES else to_float(parts[1]),
+            "smClockMHz": to_int(parts[2]),
+            "memClockMHz": to_int(parts[3]),
+            "pstate": None if parts[4] in NA_VALUES else parts[4],
+            "throttleMask": to_int(parts[5]),
+            "eccUncorrected": to_int(parts[6]),
+            "pcieGen": to_int(parts[7]),
+            "pcieWidth": to_int(parts[8]),
+        }
+        result[index] = {k: v for k, v in values.items() if v is not None}
+    return result
+
+
+def parse_compute_apps(output: str, uuid_to_index: Dict[str, int]) -> List[Dict[str, Any]]:
+    procs = []
+    for line in output.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4 or parts[0] not in uuid_to_index:
+            continue
+        pid = to_int(parts[1])
+        if pid is None:
+            continue
+        procs.append({
+            "gpuIndex": uuid_to_index[parts[0]],
+            "pid": pid,
+            "name": os.path.basename(parts[2]) or parts[2],
+            "user": None,
+            "vramMB": to_float(parts[3]),
+        })
+    return procs
+
+
+class NvidiaSmi:
+    def __init__(self) -> None:
+        self.extended_fields: Optional[List[str]] = list(EXTENDED_FIELDS)
+        self.processes_supported = True
+
+    def query(self) -> List[Dict[str, Any]]:
+        output = run(["nvidia-smi", f"--query-gpu={','.join(NVIDIA_FIELDS)}", "--format=csv,noheader,nounits"])
+        if not output:
+            return []
+        gpus = parse_nvidia_smi(output)
+        extended = self._query_extended()
+        for gpu in gpus:
+            gpu.update(extended.get(gpu["gpuIndex"], {}))
+        return gpus
+
+    def _query_extended(self) -> Dict[int, Dict[str, Any]]:
+        while self.extended_fields:
+            output = run(["nvidia-smi", f"--query-gpu={','.join(self.extended_fields)}", "--format=csv,noheader,nounits"])
+            if output is not None:
+                return parse_nvidia_extended(output)
+            # try the renamed throttle field, then give up on advanced metrics
+            current = self.extended_fields[5]
+            if current == THROTTLE_FIELD_ALIASES[0]:
+                self.extended_fields[5] = THROTTLE_FIELD_ALIASES[1]
+                continue
+            logger.info("Advanced NVIDIA metrics not supported by this driver; skipping them")
+            self.extended_fields = None
+        return {}
+
+    def processes(self, gpus: List[Dict[str, Any]], with_cmdline: bool) -> List[Dict[str, Any]]:
+        uuid_to_index = {g["uuid"]: g["gpuIndex"] for g in gpus if g.get("vendor") == "nvidia" and g.get("uuid")}
+        if not uuid_to_index or not self.processes_supported:
+            return []
+        output = run(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,process_name,used_memory", "--format=csv,noheader,nounits"])
+        if output is None:
+            self.processes_supported = False
+            return []
+        procs = parse_compute_apps(output, uuid_to_index)
+        for p in procs:
+            try:
+                proc = psutil.Process(p["pid"])
+                p["user"] = proc.username()
+                if with_cmdline:
+                    p["name"] = " ".join(proc.cmdline())[:255] or p["name"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        return procs[:512]
+
+
+_nvidia = NvidiaSmi()
+
+
 def get_nvidia_metrics() -> List[Dict[str, Any]]:
-    output = run([
-        "nvidia-smi",
-        f"--query-gpu={','.join(NVIDIA_FIELDS)}",
-        "--format=csv,noheader,nounits",
-    ])
-    return parse_nvidia_smi(output) if output else []
+    return _nvidia.query()
 
 
 def _pick(card: Dict[str, Any], *needles: str) -> Any:
@@ -209,6 +323,8 @@ class MetricsCollector:
         self.tags = [t.strip() for t in os.getenv("SERVER_TAGS", "").split(",") if t.strip()]
         self.interval = max(5, int(os.getenv("INTERVAL_SEC", "30")))
         self.disk_path = os.getenv("DISK_PATH", "/")
+        self.report_processes = os.getenv("REPORT_PROCESSES", "true").lower() != "false"
+        self.report_cmdline = os.getenv("REPORT_CMDLINE", "false").lower() == "true"
         self.buffer: deque = deque(maxlen=int(os.getenv("BUFFER_SIZE", "120")))
         self.session = requests.Session()
         self.session.headers.update({
@@ -281,13 +397,17 @@ class MetricsCollector:
         }
 
     def collect(self) -> Dict[str, Any]:
-        return {
+        gpus = get_nvidia_metrics() + get_amd_metrics()
+        payload = {
             "server": {"id": self.server_id, "name": self.server_name, "tags": self.tags},
             "host": self.host,
             "sys": self.get_system_metrics(),
-            "gpus": get_nvidia_metrics() + get_amd_metrics(),
+            "gpus": gpus,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
+        if self.report_processes and gpus:
+            payload["processes"] = _nvidia.processes(gpus, self.report_cmdline)
+        return payload
 
     def send(self, payload: Dict[str, Any]) -> Optional[bool]:
         """True = accepted, False = retry later, None = rejected for good (drop it)."""

@@ -15,13 +15,21 @@ Python collector for NVIDIA and AMD GPUs.
   copy-paste install commands (Docker, systemd, Python), edit name/tags/location, rotate
   keys, maintenance mode (mutes alerts), delete.
 - **Per-server history**: GPU utilization, temperature, VRAM and power per GPU, CPU/RAM/disk,
-  network traffic, over 1 h to 30 days (automatically downsampled), CSV export.
-- **Alerting that behaves**: rules on GPU temperature, utilization, VRAM, power, CPU, RAM,
-  disk, load or *server offline*; a rule fires only after its condition held for its
+  network traffic, over 1 h to 90 days, CSV export. Raw samples serve the last 48 h,
+  hourly rollups everything older, so a year of history stays small and fast.
+- **GPU health and usage**: processes running on each GPU (user, PID, VRAM), SM/memory
+  clocks, P-state, PCIe link, uncorrected ECC errors and throttling reasons (thermal,
+  power brake, power cap...).
+- **Alerting that behaves**: rules on GPU temperature, utilization, VRAM, power, ECC errors,
+  throttling, CPU, RAM, disk, load or *server offline*; a rule fires only after its condition held for its
   duration, resolves itself when the condition clears, and can target all servers, a tag
   or a single server. Alerts can be acknowledged or resolved by hand.
 - **Notifications**: Slack and Discord (formatted), any JSON webhook, email via SendGrid,
   on fire and on resolve, with test buttons.
+- **Maintenance windows**: schedule interventions for a server, a tag or the whole fleet;
+  alerts are muted and servers show "Maintenance" during the window.
+- **Prometheus**: `GET /metrics` (bearer token) exposes every server and GPU for
+  Prometheus / Grafana.
 - **Real time**: WebSocket push, the UI refreshes as soon as a collector reports.
 - **Users & security**: admin / viewer roles, user management, password change, JWT with
   refresh tokens, rate limiting, security audit log, per-server hashed API keys.
@@ -37,8 +45,7 @@ Requirements: Node 20+, PostgreSQL 14+, Python 3.8+ for the collector.
 ```bash
 npm install
 export DATABASE_URL=postgresql://user:pass@localhost:5432/gpu_monitor
-npm run db:push          # create / update the schema
-npm run dev              # http://localhost:5100 - login admin / admin (created on an empty database)
+npm run dev              # applies migrations, http://localhost:5100 - login admin / admin on an empty database
 
 # in another terminal: 6 fake GPU servers reporting every 10 s
 npm run simulate -- --servers 6 --interval 10
@@ -91,7 +98,9 @@ automatically instead. `REQUIRE_SERVER_KEYS=true` disables that.
 | `server/routes.ts` | REST API |
 | `server/alerting.ts`, `server/services/rules-engine.ts` | Rule evaluation, alert lifecycle, notifications |
 | `server/services/fleet.ts` | Server status and fleet statistics |
-| `server/jobs.ts` | First-run bootstrap, offline detection, retention |
+| `server/jobs.ts` | First-run bootstrap, offline detection, hourly rollups, retention |
+| `server/migrate.ts`, `migrations/` | Versioned SQL migrations, applied at startup |
+| `server/services/maintenance.ts`, `prometheus.ts` | Maintenance windows, Prometheus exposition |
 | `client/src/pages` | Dashboard, Servers, Server details, Alerts, Settings |
 | `collector/` | Python collector, Dockerfile, tests |
 | `scripts/simulate.ts` | Fleet simulator |
@@ -109,7 +118,9 @@ automatically instead. `REQUIRE_SERVER_KEYS=true` disables that.
 | `GET/POST/PATCH/DELETE` | `/api/rules[/:id]` | read: viewer, write: admin |
 | `GET/PATCH` | `/api/settings`, `POST /api/settings/test-webhook`, `/test-email` | read: viewer, write: admin |
 | `GET/POST/PATCH/DELETE` | `/api/users[/:id]`, `GET /api/audit-log` | admin |
-| `GET` | `/api/stats`, `/api/tags`, `/health` | viewer / public |
+| `GET/POST/DELETE` | `/api/maintenance-windows[/:id]` | read: viewer, write: admin |
+| `GET` | `/api/stats`, `/api/tags`, `/api/fleet/history?hours=`, `/health` | viewer / public |
+| `GET` | `/metrics` (Prometheus) | `METRICS_TOKEN` bearer |
 
 ## Tests
 
@@ -119,6 +130,21 @@ cd collector && python3 -m unittest test_collector
 npx playwright test                             # end-to-end, against the dev server
 npm run check                                   # TypeScript
 ```
+
+CI (GitHub Actions) runs all of the above plus a migration drift check and the Docker
+builds on every pull request.
+
+## Database migrations
+
+The schema lives in `shared/schema.ts`. After changing it:
+
+```bash
+npm run db:generate      # writes migrations/NNNN_*.sql - review and commit it
+npm run db:migrate       # apply (the server also applies pending migrations at startup)
+```
+
+Databases created by older versions with `drizzle-kit push` are detected and adopted
+automatically on first start.
 
 ## Roadmap
 

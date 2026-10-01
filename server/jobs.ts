@@ -34,6 +34,8 @@ export async function bootstrap(): Promise<void> {
       { name: "Disk almost full", type: "disk_util", threshold: "90", durationSec: 300, level: "warning" },
       { name: "RAM saturated", type: "ram_util", threshold: "95", durationSec: 300, level: "critical" },
       { name: "Server offline", type: "server_offline", threshold: "180", durationSec: 0, level: "critical" },
+      { name: "GPU uncorrected ECC errors", type: "gpu_ecc_errors", threshold: "1", durationSec: 0, level: "critical" },
+      { name: "GPU throttled (heat / power brake)", type: "gpu_throttling", threshold: "1", durationSec: 300, level: "warning" },
     ];
     for (const rule of defaults) await storage.createRule({ ...rule, enabled: true });
     console.log(`✅ Created ${defaults.length} default alert rules`);
@@ -64,13 +66,27 @@ export function startBackgroundJobs(): void {
     }
   }, 30_000));
 
+  // Hourly rollups for long-range charts (every 5 minutes, first run backfills)
+  const rollup = async () => {
+    try {
+      await storage.rollupHourly();
+    } catch (error) {
+      console.error("Rollup job error:", error);
+    }
+  };
+  timers.push(setTimeout(rollup, 10_000));
+  timers.push(setInterval(rollup, 5 * 60_000));
+
   // Retention (hourly)
   const purge = async () => {
     try {
       const settings = await storage.getSettings();
+      // roll up before raw data is purged so nothing is lost
+      await storage.rollupHourly();
       const result = await storage.purgeOldData(
-        Number(settings.metrics_retention_days) || 30,
+        Number(settings.metrics_retention_days) || 14,
         Number(settings.alerts_retention_days) || 90,
+        Number(settings.rollup_retention_days) || 365,
       );
       await storage.cleanupExpiredTokens();
       if (result.snapshots || result.alerts) {

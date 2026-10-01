@@ -1,4 +1,4 @@
-import { RULE_TYPE_LABELS, type Rule, type RuleType } from "@shared/schema";
+import { PROBLEM_THROTTLE_MASK, RULE_TYPE_LABELS, type Rule, type RuleType } from "@shared/schema";
 
 export interface LatestSample {
   sys?: {
@@ -13,6 +13,8 @@ export interface LatestSample {
     vramTotalMB: number;
     tempC: number;
     powerW: number;
+    throttleMask?: number | null;
+    eccUncorrected?: number | null;
   }>;
 }
 
@@ -52,6 +54,14 @@ export function metricValue(type: RuleType, sample: LatestSample): number | unde
       return sample.sys?.diskPercent;
     case "load1":
       return sample.sys?.load1;
+    case "gpu_ecc_errors": {
+      const reported = gpus.filter((g) => g.eccUncorrected !== undefined && g.eccUncorrected !== null);
+      return reported.length ? Math.max(...reported.map((g) => g.eccUncorrected!)) : undefined;
+    }
+    case "gpu_throttling": {
+      const reported = gpus.filter((g) => g.throttleMask !== undefined && g.throttleMask !== null);
+      return reported.length ? reported.filter((g) => (g.throttleMask! & PROBLEM_THROTTLE_MASK) !== 0).length : undefined;
+    }
     case "server_offline":
       return undefined; // evaluated by the offline watcher, not from samples
   }
@@ -69,7 +79,7 @@ export function alertMessage(rule: Pick<Rule, "type" | "threshold">, value: numb
   if (type === "server_offline") {
     return `No data received for ${formatDuration(value)} (threshold ${formatDuration(Number(rule.threshold))})`;
   }
-  return `${label} is ${formatValue(type, value)}, above threshold of ${formatValue(type, Number(rule.threshold))}`;
+  return `${label} is ${formatValue(type, value)} (threshold ${formatValue(type, Number(rule.threshold))})`;
 }
 
 export function formatDuration(sec: number): string {

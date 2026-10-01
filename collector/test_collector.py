@@ -2,7 +2,7 @@
 import json
 import unittest
 
-from collector import parse_nvidia_smi, parse_rocm_smi, to_float
+from collector import parse_compute_apps, parse_nvidia_extended, parse_nvidia_smi, parse_rocm_smi, to_float, to_int
 
 
 class ParseTests(unittest.TestCase):
@@ -49,6 +49,37 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(g["vramTotalMB"], 65536)
         self.assertEqual(g["vramUsedMB"], 16384)
         self.assertEqual(g["driverVersion"], "6.7.0")
+
+    def test_nvidia_extended(self):
+        out = (
+            "0, 45, 1980, 2619, P0, 0x0000000000000004, 0, 5, 16\n"
+            "1, [N/A], 210, 405, P8, 0x0000000000000041, [N/A], 4, 16\n"
+        )
+        ext = parse_nvidia_extended(out)
+        self.assertEqual(ext[0]["smClockMHz"], 1980)
+        self.assertEqual(ext[0]["throttleMask"], 4)
+        self.assertEqual(ext[0]["eccUncorrected"], 0)
+        self.assertEqual(ext[0]["pcieGen"], 5)
+        self.assertEqual(ext[1]["throttleMask"], 0x41)
+        self.assertNotIn("eccUncorrected", ext[1])
+        self.assertNotIn("memUtilPercent", ext[1])
+        self.assertEqual(ext[1]["pstate"], "P8")
+
+    def test_compute_apps(self):
+        out = (
+            "GPU-aaa, 4242, /usr/bin/python3, 30210\n"
+            "GPU-zzz, 1, unknown-gpu, 10\n"
+            "GPU-bbb, 77, [N/A], 512\n"
+        )
+        procs = parse_compute_apps(out, {"GPU-aaa": 0, "GPU-bbb": 1})
+        self.assertEqual(len(procs), 2)
+        self.assertEqual(procs[0], {"gpuIndex": 0, "pid": 4242, "name": "python3", "user": None, "vramMB": 30210})
+        self.assertEqual(procs[1]["gpuIndex"], 1)
+
+    def test_to_int(self):
+        self.assertEqual(to_int("0x10"), 16)
+        self.assertEqual(to_int("[N/A]"), None)
+        self.assertEqual(to_int("3.0"), 3)
 
     def test_to_float(self):
         self.assertEqual(to_float("[Not Supported]"), 0)

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { createServerSchema, ingestPayloadSchema, ruleInputSchema, updateSettingsSchema } from "@shared/schema";
+import { createServerSchema, decodeThrottle, ingestPayloadSchema, maintenanceWindowInputSchema, ruleInputSchema, updateSettingsSchema } from "@shared/schema";
 import { buildWebhookBody } from "../../server/alerting";
 
 describe("ingestPayloadSchema", () => {
@@ -51,5 +51,16 @@ describe("buildWebhookBody", () => {
   it("sends generic JSON elsewhere", () => {
     const body = buildWebhookBody("https://example.com/hook", n) as any;
     expect(body).toMatchObject({ event: "fired", server: "gpu-01", level: "critical", value: 91, threshold: 90 });
+  });
+});
+
+describe("phase 2 schemas", () => {
+  it("requires maintenance windows to end after they start", () => {
+    expect(maintenanceWindowInputSchema.safeParse({ startsAt: "2026-01-01T10:00:00Z", endsAt: "2026-01-01T09:00:00Z" }).success).toBe(false);
+    expect(maintenanceWindowInputSchema.safeParse({ tag: "paris", startsAt: "2026-01-01T10:00:00Z", endsAt: "2026-01-01T12:00:00Z" }).success).toBe(true);
+  });
+  it("decodes throttle reasons", () => {
+    expect(decodeThrottle(0x44).map((r) => r.key)).toEqual(["sw_power_cap", "hw_thermal"]);
+    expect(decodeThrottle(null)).toEqual([]);
   });
 });

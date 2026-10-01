@@ -55,7 +55,7 @@ curl http://localhost:5100/health
 ```
 
 **Services started:**
-- Application (127.0.0.1:5100; the database schema is synced automatically at startup)
+- Application (127.0.0.1:5100; pending database migrations are applied at startup)
 - PostgreSQL (internal only, not exposed)
 - Nginx (ports 80/443) - with `--profile production`
 - Fleet simulator (6 fake GPU servers) - with `--profile demo`, handy for a first look
@@ -150,6 +150,35 @@ python3 collector/collector.py --dry-run    # prints what would be sent
 - 6379 (Redis)
 
 **Why 5100?** Avoids conflicts with common services using 5000/8000.
+
+## Prometheus / Grafana
+
+Set `METRICS_TOKEN` in `.env`, restart, then add to `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: gpu-monitor
+    scrape_interval: 30s
+    scheme: https
+    authorization:
+      credentials: <METRICS_TOKEN>
+    static_configs:
+      - targets: ["your-monitor-domain.com"]
+```
+
+Main series: `gpumon_gpu_utilization_percent`, `gpumon_gpu_temperature_celsius`,
+`gpumon_gpu_power_watts`, `gpumon_gpu_memory_used_bytes`, `gpumon_gpu_throttled`,
+`gpumon_gpu_ecc_uncorrected_errors`, `gpumon_server_up`, `gpumon_alerts_active`
+(labels `server`, `gpu`, `model`).
+
+## Upgrading
+
+```bash
+git pull && docker compose up -d --build
+```
+
+Migrations run automatically (`DB_AUTO_MIGRATE=false` to run them yourself with
+`npm run db:migrate`). Back up the database first (see Maintenance below).
 
 ## Troubleshooting
 

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, varchar, integer, timestamp, decimal, boolean, jsonb, index, bigint } from "drizzle-orm/pg-core";
+import { pgTable, text, varchar, integer, timestamp, decimal, boolean, jsonb, index, bigint, real, primaryKey } from "drizzle-orm/pg-core";
 import { relations } from "drizzle-orm";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
@@ -20,6 +20,8 @@ export const servers = pgTable("servers", {
   cpuModel: text("cpu_model"),
   cpuCores: integer("cpu_cores"),
   collectorVersion: text("collector_version"),
+  // Latest GPU processes reported by the collector (not historised)
+  processes: jsonb("processes").$type<GpuProcess[]>(),
   // null until the first ingest: servers created from the UI start as "pending"
   lastSeenAt: timestamp("last_seen_at"),
   createdAt: timestamp("created_at").defaultNow().notNull(),
@@ -39,6 +41,16 @@ export const gpuSnapshots = pgTable("gpu_snapshots", {
   powerW: decimal("power_w", { precision: 7, scale: 2 }),
   fanPercent: decimal("fan_percent", { precision: 5, scale: 2 }),
   driverVersion: text("driver_version"),
+  // Advanced NVIDIA metrics (null when not reported)
+  memUtilPercent: real("mem_util_percent"),
+  smClockMHz: integer("sm_clock_mhz"),
+  memClockMHz: integer("mem_clock_mhz"),
+  pstate: text("pstate"),
+  // nvidia-smi clocks_throttle_reasons.active bitmask, see THROTTLE_REASONS
+  throttleMask: bigint("throttle_mask", { mode: "number" }),
+  eccUncorrected: integer("ecc_uncorrected"),
+  pcieGen: integer("pcie_gen"),
+  pcieWidth: integer("pcie_width"),
   ts: timestamp("ts").defaultNow().notNull(),
 }, (t) => [index("gpu_snapshots_server_ts_idx").on(t.serverId, t.ts)]);
 
@@ -95,6 +107,45 @@ export const settings = pgTable("settings", {
   value: text("value"),
   updatedAt: timestamp("updated_at").defaultNow().notNull(),
 });
+
+// Hourly rollups keep long-term history cheap; raw snapshots are kept for a few days
+export const gpuMetricsHourly = pgTable("gpu_metrics_hourly", {
+  serverId: varchar("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  gpuIndex: integer("gpu_index").notNull(),
+  hour: timestamp("hour").notNull(),
+  utilAvg: real("util_avg"),
+  utilMax: real("util_max"),
+  tempAvg: real("temp_avg"),
+  tempMax: real("temp_max"),
+  powerAvg: real("power_avg"),
+  vramAvg: real("vram_avg"),
+  samples: integer("samples").notNull(),
+}, (t) => [primaryKey({ columns: [t.serverId, t.gpuIndex, t.hour] }), index("gpu_metrics_hourly_hour_idx").on(t.hour)]);
+
+export const sysMetricsHourly = pgTable("sys_metrics_hourly", {
+  serverId: varchar("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  hour: timestamp("hour").notNull(),
+  cpuAvg: real("cpu_avg"),
+  cpuMax: real("cpu_max"),
+  ramAvg: real("ram_avg"),
+  diskAvg: real("disk_avg"),
+  load1Avg: real("load1_avg"),
+  netRxAvg: real("net_rx_avg"),
+  netTxAvg: real("net_tx_avg"),
+  samples: integer("samples").notNull(),
+}, (t) => [primaryKey({ columns: [t.serverId, t.hour] }), index("sys_metrics_hourly_hour_idx").on(t.hour)]);
+
+// Scheduled maintenance: alerts are muted for matching servers between startsAt and endsAt
+export const maintenanceWindows = pgTable("maintenance_windows", {
+  id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
+  serverId: varchar("server_id").references(() => servers.id, { onDelete: "cascade" }),
+  tag: text("tag"),
+  startsAt: timestamp("starts_at").notNull(),
+  endsAt: timestamp("ends_at").notNull(),
+  reason: text("reason"),
+  createdBy: text("created_by"),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+}, (t) => [index("maintenance_windows_ends_idx").on(t.endsAt)]);
 
 export const users = pgTable("users", {
   id: varchar("id").primaryKey().default(sql`gen_random_uuid()`),
@@ -164,6 +215,7 @@ export const alertsRelations = relations(alerts, ({ one }) => ({
 export const insertServerSchema = createInsertSchema(servers).omit({
   createdAt: true,
   lastSeenAt: true,
+  processes: true,
 });
 
 export const RULE_TYPES = [
@@ -175,6 +227,8 @@ export const RULE_TYPES = [
   "ram_util",
   "disk_util",
   "load1",
+  "gpu_ecc_errors",
+  "gpu_throttling",
   "server_offline",
 ] as const;
 export type RuleType = (typeof RULE_TYPES)[number];
@@ -188,8 +242,37 @@ export const RULE_TYPE_LABELS: Record<RuleType, { label: string; unit: string }>
   ram_util: { label: "RAM usage", unit: "%" },
   disk_util: { label: "Disk usage", unit: "%" },
   load1: { label: "Load average (1m)", unit: "" },
+  gpu_ecc_errors: { label: "GPU uncorrected ECC errors (max)", unit: "" },
+  gpu_throttling: { label: "GPUs throttled by heat or power brake", unit: "" },
   server_offline: { label: "Server offline", unit: "s" },
 };
+
+// nvidia-smi clocks_throttle_reasons.active bits
+export const THROTTLE_REASONS: Array<{ bit: number; key: string; label: string; problem: boolean }> = [
+  { bit: 0x1, key: "idle", label: "Idle", problem: false },
+  { bit: 0x2, key: "app_clocks", label: "Application clocks", problem: false },
+  { bit: 0x4, key: "sw_power_cap", label: "Power cap", problem: false },
+  { bit: 0x8, key: "hw_slowdown", label: "HW slowdown", problem: true },
+  { bit: 0x10, key: "sync_boost", label: "Sync boost", problem: false },
+  { bit: 0x20, key: "sw_thermal", label: "SW thermal", problem: true },
+  { bit: 0x40, key: "hw_thermal", label: "HW thermal", problem: true },
+  { bit: 0x80, key: "hw_power_brake", label: "Power brake", problem: true },
+  { bit: 0x100, key: "display_clocks", label: "Display clocks", problem: false },
+];
+export const PROBLEM_THROTTLE_MASK = THROTTLE_REASONS.filter((r) => r.problem).reduce((m, r) => m | r.bit, 0);
+
+export function decodeThrottle(mask: number | null | undefined) {
+  if (!mask) return [];
+  return THROTTLE_REASONS.filter((r) => (mask & r.bit) !== 0);
+}
+
+export interface GpuProcess {
+  gpuIndex: number;
+  pid: number;
+  name: string;
+  user: string | null;
+  vramMB: number;
+}
 
 const serverIdPattern = /^[A-Za-z0-9._-]{1,64}$/;
 
@@ -217,6 +300,14 @@ export const ruleInputSchema = z.object({
   tag: z.string().optional().nullable(),
 });
 
+export const maintenanceWindowInputSchema = z.object({
+  serverId: z.string().optional().nullable(),
+  tag: z.string().optional().nullable(),
+  startsAt: z.coerce.date(),
+  endsAt: z.coerce.date(),
+  reason: z.string().max(200).optional().nullable(),
+}).refine((w) => w.endsAt > w.startsAt, { message: "End must be after start", path: ["endsAt"] });
+
 export const SETTING_KEYS = [
   "alert_email_to",
   "webhook_url",
@@ -224,6 +315,7 @@ export const SETTING_KEYS = [
   "metrics_retention_days",
   "alerts_retention_days",
   "notify_on_resolve",
+  "rollup_retention_days",
 ] as const;
 export type SettingKey = (typeof SETTING_KEYS)[number];
 
@@ -231,7 +323,8 @@ export const SETTING_DEFAULTS: Record<SettingKey, string> = {
   alert_email_to: "",
   webhook_url: "",
   offline_after_sec: "120",
-  metrics_retention_days: "30",
+  metrics_retention_days: "14",
+  rollup_retention_days: "365",
   alerts_retention_days: "90",
   notify_on_resolve: "true",
 };
@@ -242,6 +335,7 @@ export const updateSettingsSchema = z.object({
   offline_after_sec: z.coerce.number().int().min(30).max(86400).transform(String).optional(),
   metrics_retention_days: z.coerce.number().int().min(1).max(3650).transform(String).optional(),
   alerts_retention_days: z.coerce.number().int().min(1).max(3650).transform(String).optional(),
+  rollup_retention_days: z.coerce.number().int().min(7).max(3650).transform(String).optional(),
   notify_on_resolve: z.union([z.boolean(), z.enum(["true", "false"])]).transform(String).optional(),
 });
 
@@ -339,6 +433,7 @@ export type User = typeof users.$inferSelect;
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type RefreshToken = typeof refreshTokens.$inferSelect;
 export type InsertRefreshToken = z.infer<typeof insertRefreshTokenSchema>;
+export type MaintenanceWindow = typeof maintenanceWindows.$inferSelect;
 export type SecurityAuditLog = typeof securityAuditLog.$inferSelect;
 export type InsertSecurityAuditLog = z.infer<typeof insertSecurityAuditLogSchema>;
 
@@ -384,7 +479,22 @@ export const ingestPayloadSchema = z.object({
     powerW: num,
     fanPercent: num,
     driverVersion: z.string(),
+    memUtilPercent: num.optional(),
+    smClockMHz: num.optional(),
+    memClockMHz: num.optional(),
+    pstate: z.string().max(8).optional(),
+    throttleMask: z.number().int().min(0).optional(),
+    eccUncorrected: z.number().int().min(0).optional(),
+    pcieGen: z.number().int().min(0).max(16).optional(),
+    pcieWidth: z.number().int().min(0).max(64).optional(),
   })).max(64),
+  processes: z.array(z.object({
+    gpuIndex: z.number().int(),
+    pid: z.number().int(),
+    name: z.string().max(255),
+    user: z.string().max(64).nullable().optional(),
+    vramMB: num,
+  })).max(512).optional(),
   ts: z.string(),
 });
 
@@ -405,6 +515,14 @@ export interface GpuView {
   powerW: number;
   fanPercent: number;
   driverVersion: string | null;
+  memUtilPercent: number | null;
+  smClockMHz: number | null;
+  memClockMHz: number | null;
+  pstate: string | null;
+  throttleMask: number | null;
+  eccUncorrected: number | null;
+  pcieGen: number | null;
+  pcieWidth: number | null;
 }
 
 export interface ServerView {
@@ -415,6 +533,8 @@ export interface ServerView {
   description: string | null;
   location: string | null;
   maintenance: boolean;
+  // Active scheduled maintenance window, if any
+  maintenanceWindow: { endsAt: string; reason: string | null } | null;
   hasOwnKey: boolean;
   apiKeyPrefix: string | null;
   hostname: string | null;
@@ -436,6 +556,7 @@ export interface ServerView {
   totalPowerW: number;
   maxGpuTempC: number | null;
   gpus: GpuView[];
+  processes: GpuProcess[];
 }
 
 export interface FleetStats {

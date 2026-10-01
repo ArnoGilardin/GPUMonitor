@@ -2,6 +2,7 @@ import type { Alert, Rule, RuleType, Server } from "@shared/schema";
 import { storage } from "./storage";
 import { sendEmail } from "./sendgrid";
 import { events } from "./services/events";
+import { getActiveWindows, windowFor } from "./services/maintenance";
 import { BreachTracker, alertMessage, metricValue, ruleAppliesTo, type LatestSample } from "./services/rules-engine";
 
 const tracker = new BreachTracker();
@@ -10,6 +11,7 @@ const tracker = new BreachTracker();
 export async function checkAlerts(server: Server, sample: LatestSample): Promise<void> {
   try {
     const activeRules = await storage.getActiveRules();
+    const muted = server.maintenance || !!windowFor(server, await getActiveWindows());
 
     for (const rule of activeRules) {
       if (!ruleAppliesTo(rule, server)) continue;
@@ -24,7 +26,7 @@ export async function checkAlerts(server: Server, sample: LatestSample): Promise
 
       const value = metricValue(rule.type as RuleType, sample);
       const breached = value !== undefined && value >= Number(rule.threshold);
-      const decision = server.maintenance ? "clear" : tracker.update(key, breached, rule.durationSec);
+      const decision = muted ? "clear" : tracker.update(key, breached, rule.durationSec);
 
       if (decision === "fire" && value !== undefined) {
         await fireIfNew(server, rule, value);
@@ -43,10 +45,16 @@ export async function checkOfflineServers(): Promise<void> {
     const offlineRules = (await storage.getActiveRules()).filter((r) => r.type === "server_offline");
     if (!offlineRules.length) return;
     const serverList = await storage.listServers();
+    const windows = await getActiveWindows();
     const now = Date.now();
 
     for (const server of serverList) {
-      if (!server.lastSeenAt || server.maintenance) continue;
+      if (!server.lastSeenAt) continue;
+      if (server.maintenance || windowFor(server, windows)) {
+        // a maintenance started while the server was silent: close its offline alerts
+        for (const rule of offlineRules) await resolveIfActive(server, rule, "maintenance");
+        continue;
+      }
       const silentSec = (now - new Date(server.lastSeenAt).getTime()) / 1000;
       for (const rule of offlineRules) {
         if (!ruleAppliesTo(rule, server)) continue;

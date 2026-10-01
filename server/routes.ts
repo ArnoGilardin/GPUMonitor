@@ -17,8 +17,11 @@ import {
   updateSettingsSchema,
   createUserSchema,
   updateUserSchema,
+  maintenanceWindowInputSchema,
   type InsertGpuSnapshot,
 } from "@shared/schema";
+import { invalidateWindows } from "./services/maintenance";
+import { renderPrometheusMetrics } from "./services/prometheus";
 import { setupWebSocket } from "./websocket";
 import { checkAlerts, forgetServer, sendAlertEmail, sendWebhook } from "./alerting";
 import { events } from "./services/events";
@@ -214,6 +217,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const server = await storage.upsertServerFromIngest(
       { id: serverId, name: payload.server.name, tags: payload.server.tags ?? [], ip: req.ip ?? null },
       payload.host,
+      payload.processes?.map((p) => ({ ...p, user: p.user ?? null, vramMB: Math.round(p.vramMB) })),
     );
 
     const s = payload.sys;
@@ -248,6 +252,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
         powerW: gpu.powerW.toString(),
         fanPercent: gpu.fanPercent.toString(),
         driverVersion: gpu.driverVersion,
+        memUtilPercent: gpu.memUtilPercent ?? null,
+        smClockMHz: gpu.smClockMHz === undefined ? null : Math.round(gpu.smClockMHz),
+        memClockMHz: gpu.memClockMHz === undefined ? null : Math.round(gpu.memClockMHz),
+        pstate: gpu.pstate ?? null,
+        throttleMask: gpu.throttleMask ?? null,
+        eccUncorrected: gpu.eccUncorrected ?? null,
+        pcieGen: gpu.pcieGen ?? null,
+        pcieWidth: gpu.pcieWidth ?? null,
       })),
     );
 
@@ -357,6 +369,46 @@ export async function registerRoutes(app: Express): Promise<Server> {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${req.params.id.replace(/[^\w.-]/g, "_")}-metrics.csv"`);
     res.send(lines.join("\n"));
+  }));
+
+  app.get("/api/fleet/history", authenticateJWT, h(async (req, res) => {
+    const hours = hoursSchema.safeParse(req.query.hours ?? 24);
+    if (!hours.success) return validationError(res, hours.error);
+    res.json(await storage.getFleetHistory(hours.data));
+  }));
+
+  // ---------------------------------------------------- maintenance windows
+  app.get("/api/maintenance-windows", authenticateJWT, h(async (req, res) => {
+    res.json(await storage.listMaintenanceWindows(req.query.past === "true"));
+  }));
+
+  app.post("/api/maintenance-windows", authenticateJWT, requireRole("admin"), h(async (req: AuthenticatedRequest, res) => {
+    const parsed = maintenanceWindowInputSchema.safeParse(req.body);
+    if (!parsed.success) return validationError(res, parsed.error);
+    const w = await storage.createMaintenanceWindow({
+      serverId: parsed.data.serverId || null,
+      tag: parsed.data.tag || null,
+      startsAt: parsed.data.startsAt,
+      endsAt: parsed.data.endsAt,
+      reason: parsed.data.reason || null,
+      createdBy: whoami(req),
+    });
+    invalidateWindows();
+    await logSecurityEvent({ userId: req.userId, eventType: "maintenance_scheduled", ipAddress: req.ip, details: { serverId: w.serverId, tag: w.tag, startsAt: w.startsAt, endsAt: w.endsAt } });
+    events.emitEvent({ type: "servers" });
+    res.status(201).json(w);
+  }));
+
+  // Ends a running window now, or deletes a future one
+  app.delete("/api/maintenance-windows/:id", authenticateJWT, requireRole("admin"), h(async (req, res) => {
+    const all = await storage.listMaintenanceWindows(true);
+    const w = all.find((x) => x.id === req.params.id);
+    if (!w) return res.status(404).json({ message: "Maintenance window not found" });
+    if (w.startsAt <= new Date()) await storage.endMaintenanceWindow(w.id);
+    else await storage.deleteMaintenanceWindow(w.id);
+    invalidateWindows();
+    events.emitEvent({ type: "servers" });
+    res.status(204).send();
   }));
 
   // ---------------------------------------------------------------- alerts
@@ -535,6 +587,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const stats = await getFleetStats();
     // totalPowerConsumption kept for older clients
     res.json({ ...stats, totalPowerConsumption: stats.totalPowerKW });
+  }));
+
+  // ------------------------------------------------------------ prometheus
+  // Disabled unless METRICS_TOKEN (Bearer) is set or METRICS_PUBLIC=true
+  app.get("/metrics", h(async (req, res) => {
+    const token = process.env.METRICS_TOKEN;
+    const isPublic = process.env.METRICS_PUBLIC === "true";
+    if (!token && !isPublic) return res.status(404).json({ message: "Not found" });
+    if (!isPublic) {
+      const given = req.headers.authorization?.replace(/^Bearer\s+/i, "") ?? "";
+      const a = crypto.createHash("sha256").update(given).digest();
+      const b = crypto.createHash("sha256").update(token!).digest();
+      if (!crypto.timingSafeEqual(a, b)) return res.status(401).json({ message: "Invalid metrics token" });
+    }
+    res.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    res.send(await renderPrometheusMetrics());
   }));
 
   // Unknown API routes should not fall through to the SPA

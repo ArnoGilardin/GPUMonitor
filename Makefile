@@ -24,8 +24,11 @@ clean: ## Clean build artifacts
 	rm -rf client/dist/
 
 ##@ Database
-migrate: ## Run database migrations
-	npm run db:push
+migrate: ## Apply database migrations
+	npm run db:migrate
+
+migration: ## Generate a migration after editing shared/schema.ts
+	npm run db:generate
 
 simulate: ## Send metrics from simulated GPU servers (SERVERS=6)
 	npm run simulate -- --servers $(or $(SERVERS),6)
@@ -112,4 +115,4 @@ status: ## Show system status
 	@echo "Node version: $$(node --version)"
 	@echo "NPM version: $$(npm --version)"
 	@echo "Docker version: $$(docker --version 2>/dev/null || echo 'Docker not installed')"
-	@echo "Database status: $$(npm run db:push --dry-run 2>/dev/null && echo 'OK' || echo 'Not configured')"
+	@echo "Database: $$(curl -sf http://localhost:$${PORT:-5100}/health >/dev/null && echo 'OK (app healthy)' || echo 'app not running')"

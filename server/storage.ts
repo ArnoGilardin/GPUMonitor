@@ -8,7 +8,12 @@ import {
   users,
   refreshTokens,
   securityAuditLog,
+  gpuMetricsHourly,
+  sysMetricsHourly,
+  maintenanceWindows,
   SETTING_DEFAULTS,
+  type GpuProcess,
+  type MaintenanceWindow,
   type Server,
   type InsertServer,
   type GpuSnapshot,
@@ -28,7 +33,7 @@ import {
   type InsertSecurityAuditLog,
 } from "@shared/schema";
 import { db } from "./db";
-import { eq, desc, and, gte, lt, isNull, isNotNull, sql, count } from "drizzle-orm";
+import { eq, desc, and, gte, lte, lt, isNull, isNotNull, sql, count } from "drizzle-orm";
 
 export type AlertWithRefs = Alert & {
   server: { name: string | null } | null;
@@ -139,6 +144,7 @@ export class DatabaseStorage {
   async upsertServerFromIngest(
     data: { id: string; name: string; tags: string[]; ip: string | null },
     host: HostInfo | undefined,
+    processes?: GpuProcess[],
   ): Promise<Server> {
     const now = new Date();
     const hostFields = {
@@ -150,7 +156,7 @@ export class DatabaseStorage {
     };
     const [row] = await db
       .insert(servers)
-      .values({ ...data, ...hostFields, lastSeenAt: now })
+      .values({ ...data, ...hostFields, processes: processes ?? null, lastSeenAt: now })
       .onConflictDoUpdate({
         target: servers.id,
         set: {
@@ -162,6 +168,8 @@ export class DatabaseStorage {
           cpuModel: sql`COALESCE(excluded.cpu_model, ${servers.cpuModel})`,
           cpuCores: sql`COALESCE(excluded.cpu_cores, ${servers.cpuCores})`,
           collectorVersion: sql`COALESCE(excluded.collector_version, ${servers.collectorVersion})`,
+          // collectors without process reporting leave the column untouched
+          processes: processes === undefined ? sql`${servers.processes}` : sql`excluded.processes`,
           lastSeenAt: now,
         },
       })
@@ -212,38 +220,67 @@ export class DatabaseStorage {
     return map;
   }
 
-  /** Time series averaged into buckets so charts stay light for long ranges. */
+  /**
+   * Time series averaged into buckets so charts stay light for long ranges.
+   * Up to 48 h the raw snapshots are used; beyond that the hourly rollups.
+   */
   async getServerMetrics(serverId: string, hours: number): Promise<{
     bucketSec: number;
+    source: "raw" | "hourly";
     system: MetricBucket[];
     gpus: MetricBucket[];
   }> {
     const bucketSec = pickBucket(hours);
     const since = new Date(Date.now() - hours * 3600 * 1000);
-    const bucket = sql.raw(`to_timestamp(floor(extract(epoch from ts) / ${bucketSec}) * ${bucketSec})`);
+    const source = hours > 48 ? "hourly" : "raw";
+    const bucketOf = (col: string) => sql.raw(`to_timestamp(floor(extract(epoch from ${col}) / ${bucketSec}) * ${bucketSec})`);
 
-    const [sysResult, gpuResult] = await Promise.all([
-      db.execute(sql`
-        SELECT ${bucket} AS bucket,
-          avg(cpu_percent)::float AS cpu,
-          avg(ram_percent)::float AS ram,
-          avg(disk_percent)::float AS disk,
-          avg(load1)::float AS load1,
-          avg(net_rx_bps)::float AS net_rx,
-          avg(net_tx_bps)::float AS net_tx
-        FROM ${sysSnapshots}
-        WHERE server_id = ${serverId} AND ts >= ${since}
-        GROUP BY 1 ORDER BY 1`),
-      db.execute(sql`
-        SELECT ${bucket} AS bucket, gpu_index,
-          avg(util_percent)::float AS util,
-          avg(temp_c)::float AS temp,
-          avg(power_w)::float AS power,
-          avg(CASE WHEN vram_total_mb > 0 THEN vram_used_mb * 100.0 / vram_total_mb END)::float AS vram
-        FROM ${gpuSnapshots}
-        WHERE server_id = ${serverId} AND ts >= ${since}
-        GROUP BY 1, 2 ORDER BY 1, 2`),
-    ]);
+    const [sysResult, gpuResult] = source === "raw"
+      ? await Promise.all([
+          db.execute(sql`
+            SELECT ${bucketOf("ts")} AS bucket,
+              avg(cpu_percent)::float AS cpu,
+              avg(ram_percent)::float AS ram,
+              avg(disk_percent)::float AS disk,
+              avg(load1)::float AS load1,
+              avg(net_rx_bps)::float AS net_rx,
+              avg(net_tx_bps)::float AS net_tx
+            FROM ${sysSnapshots}
+            WHERE server_id = ${serverId} AND ts >= ${since}
+            GROUP BY 1 ORDER BY 1`),
+          db.execute(sql`
+            SELECT ${bucketOf("ts")} AS bucket, gpu_index,
+              avg(util_percent)::float AS util,
+              avg(temp_c)::float AS temp,
+              avg(power_w)::float AS power,
+              avg(CASE WHEN vram_total_mb > 0 THEN vram_used_mb * 100.0 / vram_total_mb END)::float AS vram
+            FROM ${gpuSnapshots}
+            WHERE server_id = ${serverId} AND ts >= ${since}
+            GROUP BY 1, 2 ORDER BY 1, 2`),
+        ])
+      : await Promise.all([
+          // averages are weighted by the number of samples behind each hour
+          db.execute(sql`
+            SELECT ${bucketOf("hour")} AS bucket,
+              (sum(cpu_avg * samples) / sum(samples))::float AS cpu,
+              (sum(ram_avg * samples) / sum(samples))::float AS ram,
+              (sum(disk_avg * samples) / sum(samples))::float AS disk,
+              (sum(load1_avg * samples) / sum(samples))::float AS load1,
+              (sum(net_rx_avg * samples) / sum(samples))::float AS net_rx,
+              (sum(net_tx_avg * samples) / sum(samples))::float AS net_tx
+            FROM ${sysMetricsHourly}
+            WHERE server_id = ${serverId} AND hour >= ${since}
+            GROUP BY 1 ORDER BY 1`),
+          db.execute(sql`
+            SELECT ${bucketOf("hour")} AS bucket, gpu_index,
+              (sum(util_avg * samples) / sum(samples))::float AS util,
+              (sum(temp_avg * samples) / sum(samples))::float AS temp,
+              (sum(power_avg * samples) / sum(samples))::float AS power,
+              (sum(vram_avg * samples) / sum(samples))::float AS vram
+            FROM ${gpuMetricsHourly}
+            WHERE server_id = ${serverId} AND hour >= ${since}
+            GROUP BY 1, 2 ORDER BY 1, 2`),
+        ]);
 
     const round = (v: unknown) => (v === null || v === undefined ? null : Math.round(Number(v) * 10) / 10);
     const system = (sysResult.rows as any[]).map((r) => ({
@@ -269,7 +306,68 @@ export class DatabaseStorage {
       row.powerTotal = round(Number(row.powerTotal) + Number(r.power || 0));
       byTs.set(ts, row);
     }
-    return { bucketSec, system, gpus: Array.from(byTs.values()) };
+    return { bucketSec, source, system, gpus: Array.from(byTs.values()) };
+  }
+
+  /**
+   * Aggregate raw snapshots into hourly rollups. Recomputes the last few
+   * hours on every run so the current hour and late reports are included;
+   * the first run backfills everything still in the raw tables.
+   */
+  async rollupHourly(): Promise<void> {
+    const [{ last }] = (await db.execute(sql`SELECT max(hour) AS last FROM ${sysMetricsHourly}`)).rows as any[];
+    const from = last ? new Date(new Date(last).getTime() - 3 * 3600 * 1000) : new Date(0);
+
+    await db.execute(sql`
+      INSERT INTO ${gpuMetricsHourly} (server_id, gpu_index, hour, util_avg, util_max, temp_avg, temp_max, power_avg, vram_avg, samples)
+      SELECT server_id, gpu_index, date_trunc('hour', ts),
+        avg(util_percent), max(util_percent), avg(temp_c), max(temp_c), avg(power_w),
+        avg(CASE WHEN vram_total_mb > 0 THEN vram_used_mb * 100.0 / vram_total_mb END), count(*)
+      FROM ${gpuSnapshots}
+      WHERE ts >= date_trunc('hour', ${from}::timestamp)
+      GROUP BY 1, 2, 3
+      ON CONFLICT (server_id, gpu_index, hour) DO UPDATE SET
+        util_avg = excluded.util_avg, util_max = excluded.util_max, temp_avg = excluded.temp_avg,
+        temp_max = excluded.temp_max, power_avg = excluded.power_avg, vram_avg = excluded.vram_avg,
+        samples = excluded.samples`);
+
+    await db.execute(sql`
+      INSERT INTO ${sysMetricsHourly} (server_id, hour, cpu_avg, cpu_max, ram_avg, disk_avg, load1_avg, net_rx_avg, net_tx_avg, samples)
+      SELECT server_id, date_trunc('hour', ts),
+        avg(cpu_percent), max(cpu_percent), avg(ram_percent), avg(disk_percent), avg(load1),
+        avg(net_rx_bps), avg(net_tx_bps), count(*)
+      FROM ${sysSnapshots}
+      WHERE ts >= date_trunc('hour', ${from}::timestamp)
+      GROUP BY 1, 2
+      ON CONFLICT (server_id, hour) DO UPDATE SET
+        cpu_avg = excluded.cpu_avg, cpu_max = excluded.cpu_max, ram_avg = excluded.ram_avg,
+        disk_avg = excluded.disk_avg, load1_avg = excluded.load1_avg, net_rx_avg = excluded.net_rx_avg,
+        net_tx_avg = excluded.net_tx_avg, samples = excluded.samples`);
+  }
+
+  /** GPU utilization of the whole fleet over time (for the dashboard). */
+  async getFleetHistory(hours: number): Promise<MetricBucket[]> {
+    const since = new Date(Date.now() - hours * 3600 * 1000);
+    const bucketSec = Math.max(pickBucket(hours), 300);
+    const result = hours > 48
+      ? await db.execute(sql`
+          SELECT ${sql.raw(`to_timestamp(floor(extract(epoch from hour) / ${bucketSec}) * ${bucketSec})`)} AS bucket,
+            (sum(util_avg * samples) / sum(samples))::float AS util,
+            (sum(power_avg * samples) / sum(samples))::float AS power_per_gpu,
+            count(DISTINCT (server_id, gpu_index))::int AS gpus
+          FROM ${gpuMetricsHourly} WHERE hour >= ${since} GROUP BY 1 ORDER BY 1`)
+      : await db.execute(sql`
+          SELECT ${sql.raw(`to_timestamp(floor(extract(epoch from ts) / ${bucketSec}) * ${bucketSec})`)} AS bucket,
+            avg(util_percent)::float AS util,
+            avg(power_w)::float AS power_per_gpu,
+            count(DISTINCT (server_id, gpu_index))::int AS gpus
+          FROM ${gpuSnapshots} WHERE ts >= ${since} GROUP BY 1 ORDER BY 1`);
+    return (result.rows as any[]).map((r) => ({
+      ts: new Date(r.bucket).toISOString(),
+      util: r.util === null ? null : Math.round(r.util * 10) / 10,
+      // estimate of the fleet power: average per GPU x GPUs seen in the bucket
+      powerKW: r.power_per_gpu === null ? null : Math.round((r.power_per_gpu * r.gpus) / 100) / 10,
+    }));
   }
 
   async exportServerMetrics(serverId: string, hours: number) {
@@ -388,6 +486,38 @@ export class DatabaseStorage {
     return Number(row?.n ?? 0);
   }
 
+  // -------------------------------------------------- maintenance windows
+  async listMaintenanceWindows(includePast = false): Promise<MaintenanceWindow[]> {
+    return db
+      .select()
+      .from(maintenanceWindows)
+      .where(includePast ? undefined : gte(maintenanceWindows.endsAt, new Date()))
+      .orderBy(maintenanceWindows.startsAt);
+  }
+
+  /** Windows overlapping [from, to] (defaults to "active now"). */
+  async getActiveMaintenanceWindows(from = new Date(), to = from): Promise<MaintenanceWindow[]> {
+    return db
+      .select()
+      .from(maintenanceWindows)
+      .where(and(lte(maintenanceWindows.startsAt, to), gte(maintenanceWindows.endsAt, from)));
+  }
+
+  async createMaintenanceWindow(w: Omit<MaintenanceWindow, "id" | "createdAt">): Promise<MaintenanceWindow> {
+    const [created] = await db.insert(maintenanceWindows).values(w).returning();
+    return created;
+  }
+
+  async deleteMaintenanceWindow(id: string): Promise<void> {
+    await db.delete(maintenanceWindows).where(eq(maintenanceWindows.id, id));
+  }
+
+  /** End a window now (keeps it in history). */
+  async endMaintenanceWindow(id: string): Promise<MaintenanceWindow | undefined> {
+    const [row] = await db.update(maintenanceWindows).set({ endsAt: new Date() }).where(eq(maintenanceWindows.id, id)).returning();
+    return row;
+  }
+
   // ------------------------------------------------------------- settings
   async getSettings(): Promise<Record<SettingKey, string>> {
     const rows = await db.select().from(settings);
@@ -409,8 +539,12 @@ export class DatabaseStorage {
   }
 
   // ------------------------------------------------------------ retention
-  async purgeOldData(metricsDays: number, alertsDays: number): Promise<{ snapshots: number; alerts: number }> {
+  async purgeOldData(metricsDays: number, alertsDays: number, rollupDays = 365): Promise<{ snapshots: number; alerts: number }> {
     const metricsCutoff = new Date(Date.now() - metricsDays * 86400 * 1000);
+    const rollupCutoff = new Date(Date.now() - rollupDays * 86400 * 1000);
+    await db.delete(gpuMetricsHourly).where(lt(gpuMetricsHourly.hour, rollupCutoff));
+    await db.delete(sysMetricsHourly).where(lt(sysMetricsHourly.hour, rollupCutoff));
+    await db.delete(maintenanceWindows).where(lt(maintenanceWindows.endsAt, alertsCutoffFor(alertsDays)));
     const alertsCutoff = new Date(Date.now() - alertsDays * 86400 * 1000);
     const g = await db.delete(gpuSnapshots).where(lt(gpuSnapshots.ts, metricsCutoff));
     const s = await db.delete(sysSnapshots).where(lt(sysSnapshots.ts, metricsCutoff));
@@ -462,6 +596,10 @@ export class DatabaseStorage {
   }
 }
 
+function alertsCutoffFor(days: number) {
+  return new Date(Date.now() - days * 86400 * 1000);
+}
+
 function serverIdsSql(ids: string[]) {
   return sql`(${sql.join(ids.map((id) => sql`${id}`), sql`, `)})`;
 }
@@ -470,8 +608,11 @@ function pickBucket(hours: number): number {
   if (hours <= 1) return 30;
   if (hours <= 6) return 120;
   if (hours <= 24) return 600;
-  if (hours <= 72) return 1800;
-  return 3600;
+  if (hours <= 48) return 1800;
+  // beyond 48 h the data comes from hourly rollups
+  if (hours <= 168) return 3600;
+  if (hours <= 720) return 3 * 3600;
+  return 6 * 3600;
 }
 
 function mapSysRow(r: any): SysSnapshot {
@@ -510,6 +651,14 @@ function mapGpuRow(r: any): GpuSnapshot {
     powerW: r.power_w,
     fanPercent: r.fan_percent,
     driverVersion: r.driver_version,
+    memUtilPercent: r.mem_util_percent,
+    smClockMHz: r.sm_clock_mhz,
+    memClockMHz: r.mem_clock_mhz,
+    pstate: r.pstate,
+    throttleMask: num(r.throttle_mask),
+    eccUncorrected: r.ecc_uncorrected,
+    pcieGen: r.pcie_gen,
+    pcieWidth: r.pcie_width,
     ts: new Date(r.ts),
   };
 }

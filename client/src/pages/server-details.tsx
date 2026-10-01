@@ -8,7 +8,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
-import { ArrowLeft, Activity, Thermometer, Zap, MemoryStick, Cpu, Network, Download, Pencil, Wrench, KeyRound, Trash2 } from "lucide-react";
+import { ArrowLeft, Activity, Thermometer, Zap, MemoryStick, Cpu, Network, Download, Pencil, Wrench, KeyRound, Trash2, CalendarClock, ListTree } from "lucide-react";
+import MaintenanceDialog from "@/components/maintenance-dialog";
 import Header from "@/components/layout/header";
 import MetricChart, { type Series } from "@/components/charts/metric-chart";
 import AlertItem, { type AlertView } from "@/components/alert-item";
@@ -21,21 +22,40 @@ import { useAuth } from "@/lib/auth";
 import { useToast } from "@/hooks/use-toast";
 import { timeAgo, formatUptime, formatBytesPerSec, formatMB } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { ServerView } from "@shared/schema";
+import { decodeThrottle, type ServerView } from "@shared/schema";
 
 interface Metrics {
   bucketSec: number;
+  source: "raw" | "hourly";
   system: Array<Record<string, number | string | null>>;
   gpus: Array<Record<string, number | string | null>>;
 }
 
-const RANGES: Array<[string, number]> = [["1h", 1], ["6h", 6], ["24h", 24], ["7d", 168], ["30d", 720]];
+const RANGES: Array<[string, number]> = [["1h", 1], ["6h", 6], ["24h", 24], ["7d", 168], ["30d", 720], ["90d", 2160]];
 
 function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex justify-between gap-4 py-1.5 text-sm border-b border-border last:border-0">
       <span className="text-muted-foreground shrink-0">{label}</span>
       <span className="text-foreground text-right truncate">{value ?? "—"}</span>
+    </div>
+  );
+}
+
+function GpuHealth({ gpu }: { gpu: ServerView["gpus"][number] }) {
+  const reasons = decodeThrottle(gpu.throttleMask).filter((r) => r.key !== "idle");
+  const ecc = gpu.eccUncorrected ?? 0;
+  if (!reasons.length && !ecc) {
+    return <span className="text-xs text-success">{gpu.throttleMask === null && gpu.eccUncorrected === null ? "—" : "OK"}</span>;
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {ecc > 0 && <Badge variant="outline" className="text-[10px] text-error border-error/40">{ecc} ECC</Badge>}
+      {reasons.map((r) => (
+        <Badge key={r.key} variant="outline" className={cn("text-[10px] whitespace-nowrap", r.problem ? "text-warning border-warning/40" : "text-muted-foreground")}>
+          {r.label}
+        </Badge>
+      ))}
     </div>
   );
 }
@@ -47,6 +67,7 @@ export default function ServerDetails() {
   const { toast } = useToast();
   const [hours, setHours] = useState(1);
   const [editOpen, setEditOpen] = useState(false);
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
   const [confirm, setConfirm] = useState<"delete" | "rotate" | null>(null);
   const actions = useServerActions();
 
@@ -115,6 +136,7 @@ export default function ServerDetails() {
             <ToggleGroup type="single" value={String(hours)} onValueChange={(v) => v && setHours(Number(v))} variant="outline" size="sm" data-testid="range-selector">
               {RANGES.map(([label, h]) => <ToggleGroupItem key={h} value={String(h)} className="px-3">{label}</ToggleGroupItem>)}
             </ToggleGroup>
+            {metrics?.source === "hourly" && <span className="text-xs text-muted-foreground">hourly averages</span>}
             <Button variant="outline" size="sm" onClick={exportCsv} data-testid="export-csv"><Download className="h-4 w-4 mr-1" />CSV</Button>
             {isAdmin && (
               <>
@@ -122,12 +144,25 @@ export default function ServerDetails() {
                 <Button variant="outline" size="sm" onClick={() => actions.maintenance.mutate({ id: server.id, on: !server.maintenance })} data-testid="toggle-maintenance">
                   <Wrench className="h-4 w-4 mr-1" />{server.maintenance ? "End maintenance" : "Maintenance"}
                 </Button>
+                <Button variant="outline" size="sm" onClick={() => setMaintenanceOpen(true)} data-testid="schedule-maintenance">
+                  <CalendarClock className="h-4 w-4 mr-1" />Schedule
+                </Button>
                 <Button variant="outline" size="sm" onClick={() => setConfirm("rotate")}><KeyRound className="h-4 w-4 mr-1" />Key</Button>
                 <Button variant="outline" size="sm" className="text-error" onClick={() => setConfirm("delete")} aria-label="Delete server"><Trash2 className="h-4 w-4" /></Button>
               </>
             )}
           </div>
         </div>
+
+        {server.maintenanceWindow && (
+          <Card className="border-chart-4/50 bg-chart-4/10" data-testid="maintenance-banner">
+            <CardContent className="p-4 text-sm flex items-center gap-2">
+              <CalendarClock className="h-4 w-4 text-chart-4 shrink-0" />
+              Scheduled maintenance until {new Date(server.maintenanceWindow.endsAt).toLocaleString()}
+              {server.maintenanceWindow.reason ? ` · ${server.maintenanceWindow.reason}` : ""}. Alerts are muted.
+            </CardContent>
+          </Card>
+        )}
 
         {server.status === "pending" && (
           <Card className="border-dashed">
@@ -206,7 +241,7 @@ export default function ServerDetails() {
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-          <Card className="xl:col-span-2">
+          <Card className="xl:col-span-3">
             <CardHeader><CardTitle className="text-base">GPUs</CardTitle></CardHeader>
             <CardContent className="p-0 overflow-x-auto">
               <Table data-testid="gpu-details-table">
@@ -219,16 +254,19 @@ export default function ServerDetails() {
                     <TableHead>Temp</TableHead>
                     <TableHead>Power</TableHead>
                     <TableHead>Fan</TableHead>
+                    <TableHead className="hidden xl:table-cell">Clocks</TableHead>
+                    <TableHead className="hidden xl:table-cell">PCIe</TableHead>
+                    <TableHead>Health</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {server.gpus.length === 0 ? (
-                    <TableRow><TableCell colSpan={7} className="text-center text-muted-foreground py-8">No GPU reported</TableCell></TableRow>
+                    <TableRow><TableCell colSpan={10} className="text-center text-muted-foreground py-8">No GPU reported</TableCell></TableRow>
                   ) : server.gpus.map((g) => (
                     <TableRow key={g.gpuIndex} data-testid={`gpu-row-${g.gpuIndex}`}>
                       <TableCell>{g.gpuIndex}</TableCell>
                       <TableCell>
-                        <div className="text-sm">{g.name}</div>
+                        <div className="text-sm whitespace-nowrap">{g.name}</div>
                         <div className="text-xs text-muted-foreground">driver {g.driverVersion ?? "?"}</div>
                       </TableCell>
                       <TableCell className="min-w-28">
@@ -239,8 +277,43 @@ export default function ServerDetails() {
                         {g.vramTotalMB ? `${formatMB(g.vramUsedMB)} / ${formatMB(g.vramTotalMB)}` : "—"}
                       </TableCell>
                       <TableCell className={cn("text-sm", g.tempC >= 85 ? "text-error" : g.tempC >= 80 ? "text-warning" : "")}>{g.tempC}°C</TableCell>
-                      <TableCell className="text-sm">{g.powerW} W</TableCell>
+                      <TableCell className="text-sm whitespace-nowrap">{g.powerW} W</TableCell>
                       <TableCell className="text-sm">{g.fanPercent}%</TableCell>
+                      <TableCell className="hidden xl:table-cell text-xs text-muted-foreground whitespace-nowrap">
+                        {g.smClockMHz !== null ? <>{g.smClockMHz} / {g.memClockMHz ?? "?"} MHz{g.pstate ? ` · ${g.pstate}` : ""}</> : "—"}
+                      </TableCell>
+                      <TableCell className="hidden xl:table-cell text-xs text-muted-foreground whitespace-nowrap">
+                        {g.pcieGen ? `Gen${g.pcieGen} x${g.pcieWidth ?? "?"}` : "—"}
+                      </TableCell>
+                      <TableCell>
+                        <GpuHealth gpu={g} />
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+
+          <Card className="xl:col-span-2">
+            <CardHeader>
+              <CardTitle className="text-base flex items-center"><ListTree className="h-4 w-4 mr-2" />GPU processes</CardTitle>
+            </CardHeader>
+            <CardContent className="p-0 overflow-x-auto">
+              <Table data-testid="processes-table">
+                <TableHeader>
+                  <TableRow><TableHead>GPU</TableHead><TableHead>PID</TableHead><TableHead>User</TableHead><TableHead>Process</TableHead><TableHead className="text-right">VRAM</TableHead></TableRow>
+                </TableHeader>
+                <TableBody>
+                  {server.processes.length === 0 ? (
+                    <TableRow><TableCell colSpan={5} className="text-center text-muted-foreground py-6">No process using the GPUs (or not reported by this collector)</TableCell></TableRow>
+                  ) : [...server.processes].sort((a, b) => a.gpuIndex - b.gpuIndex || b.vramMB - a.vramMB).map((p) => (
+                    <TableRow key={`${p.gpuIndex}-${p.pid}`}>
+                      <TableCell>{p.gpuIndex}</TableCell>
+                      <TableCell className="font-mono text-xs">{p.pid}</TableCell>
+                      <TableCell>{p.user ?? "—"}</TableCell>
+                      <TableCell className="text-sm max-w-96 truncate" title={p.name}>{p.name}</TableCell>
+                      <TableCell className="text-right text-sm whitespace-nowrap">{formatMB(p.vramMB)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
@@ -280,6 +353,7 @@ export default function ServerDetails() {
       </div>
 
       <ServerFormDialog open={editOpen} onOpenChange={setEditOpen} server={server} />
+      <MaintenanceDialog open={maintenanceOpen} onOpenChange={setMaintenanceOpen} server={server} />
       {actions.install && <InstallInstructionsDialog open onOpenChange={(o) => !o && actions.setInstall(null)} {...actions.install} />}
 
       <AlertDialog open={!!confirm} onOpenChange={(o) => !o && setConfirm(null)}>

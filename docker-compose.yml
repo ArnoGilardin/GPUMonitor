@@ -23,6 +23,7 @@ services:
       - DB_AUTO_MIGRATE=${DB_AUTO_MIGRATE:-true}
       - TRUST_PROXY=${TRUST_PROXY:-true}
       - FRONTEND_URL=${FRONTEND_URL}
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy

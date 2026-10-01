@@ -54,18 +54,37 @@ Objectif : un outil réellement utilisable pour superviser plusieurs serveurs GP
   installeur systemd / Docker.
 - Tests : 30 tests unitaires (vitest), tests du collecteur, 8 tests e2e Playwright.
 
-## Phase 2 — Exploitation à grande échelle (prochaine étape)
+## Phase 2 — Exploitation à grande échelle ✅ (livrée dans la v2.1)
+
+- **Migrations versionnées** (`migrations/`, `npm run db:generate` / `db:migrate`),
+  appliquées au démarrage sous verrou PostgreSQL (plusieurs instances possibles).
+  Les bases créées avec `drizzle-kit push` (v1 ou v2) sont reconnues et reprises
+  automatiquement. La CI échoue si le schéma change sans migration.
+- **Agrégats horaires** (`gpu_metrics_hourly`, `sys_metrics_hourly`) calculés toutes les
+  5 minutes : les graphiques au-delà de 48 h et l'historique du parc les utilisent.
+  Rétention séparée : données brutes 14 j, agrégats 365 j (réglables). Graphiques
+  jusqu'à 90 jours. Pas de dépendance à TimescaleDB.
+- **Processus GPU** (utilisateur, PID, VRAM) affichés sur la page serveur ;
+  ligne de commande complète en option (`REPORT_CMDLINE`, désactivée par défaut).
+- **Métriques NVIDIA avancées** : fréquences SM/mémoire, P-state, lien PCIe, erreurs ECC
+  non corrigées, causes de bridage (thermique, power brake, power cap…), avec repli
+  automatique si le pilote ne les connaît pas. Deux nouvelles règles : erreurs ECC et
+  GPU bridés.
+- **Fenêtres de maintenance planifiées** pour un serveur, un tag ou tout le parc
+  (onglet Paramètres → Maintenance ou bouton « Schedule » sur un serveur).
+- **Export Prometheus** `GET /metrics` protégé par jeton (`METRICS_TOKEN`).
+- **Historique du parc** sur le tableau de bord (utilisation GPU sur 24 h).
+- **Intégration continue** GitHub Actions : typecheck, tests unitaires, tests collecteur,
+  build, contrôle de dérive des migrations, e2e Playwright avec PostgreSQL, images Docker.
+
+### Reste à faire (reporté)
 
 | Priorité | Chantier | Pourquoi |
 | --- | --- | --- |
-| Haute | Migrations versionnées (`drizzle-kit generate`) au lieu de `push` | Mises à jour sûres et réversibles en production |
-| Haute | Agrégats continus (TimescaleDB ou tables horaires) | Garder des mois d'historique avec des centaines de GPU |
-| Haute | Intégration continue (typecheck, tests, build Docker) | Éviter les régressions |
-| Moyenne | Métriques par processus GPU (qui utilise quel GPU, `nvidia-smi --query-compute-apps`) | Question n°1 des utilisateurs d'un cluster |
-| Moyenne | Métriques NVIDIA avancées : ECC, throttling, clocks, PCIe, NVLink (DCGM) | Détecter les GPU défaillants avant la panne |
-| Moyenne | Export Prometheus `/metrics` et datasource Grafana | S'intégrer à l'existant |
-| Moyenne | Fenêtres de maintenance planifiées et silences d'alertes | Interventions prévues sans bruit |
-| Basse | Envoi groupé du collecteur (batch) et compression | Parcs de plus de 500 serveurs |
+| Moyenne | Processus GPU sur AMD (`rocm-smi --showpids`) | Parité NVIDIA / AMD |
+| Moyenne | Historique des processus (qui a utilisé quel GPU, combien de temps) | Refacturation interne, quotas |
+| Basse | Envoi groupé et compressé depuis le collecteur | Parcs de plus de 500 serveurs |
+| Basse | DCGM (NVLink, XID errors) en source optionnelle | Diagnostic matériel avancé |
 
 ## Phase 3 — Fonctionnalités d'équipe
 

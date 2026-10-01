@@ -44,7 +44,11 @@ export default function ServerCard({ server }: { server: ServerView }) {
           <div className="flex-1 flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
             {server.status === "maintenance" ? <Wrench className="h-8 w-8 mb-2" /> : <Clock className="h-8 w-8 mb-2" />}
             <p className="text-sm">
-              {server.status === "pending" ? "Waiting for the collector's first report" : server.status === "maintenance" ? "In maintenance, alerts are muted" : "No data received"}
+              {server.status === "pending"
+                ? "Waiting for the collector's first report"
+                : server.maintenanceWindow
+                  ? `Maintenance until ${new Date(server.maintenanceWindow.endsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}${server.maintenanceWindow.reason ? ` · ${server.maintenanceWindow.reason}` : ""}`
+                  : server.status === "maintenance" ? "In maintenance, alerts are muted" : "No data received"}
             </p>
             <p className="text-xs mt-1">Last seen {timeAgo(server.lastSeenAt)}</p>
           </div>

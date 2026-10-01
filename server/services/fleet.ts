@@ -1,4 +1,5 @@
-import type { Alert, FleetStats, GpuSnapshot, GpuView, Server, ServerStatus, ServerView, SysSnapshot } from "@shared/schema";
+import type { Alert, FleetStats, GpuSnapshot, GpuView, MaintenanceWindow, Server, ServerStatus, ServerView, SysSnapshot } from "@shared/schema";
+import { getActiveWindows, windowFor } from "./maintenance";
 import { storage } from "../storage";
 
 export function computeStatus(
@@ -6,8 +7,9 @@ export function computeStatus(
   activeAlerts: Pick<Alert, "level">[],
   offlineAfterSec: number,
   now = Date.now(),
+  inMaintenanceWindow = false,
 ): ServerStatus {
-  if (server.maintenance) return "maintenance";
+  if (server.maintenance || inMaintenanceWindow) return "maintenance";
   if (!server.lastSeenAt) return "pending";
   if (now - new Date(server.lastSeenAt).getTime() > offlineAfterSec * 1000) return "offline";
   if (activeAlerts.some((a) => a.level === "critical")) return "error";
@@ -28,6 +30,14 @@ function toGpuView(g: GpuSnapshot): GpuView {
     powerW: Number(g.powerW ?? 0),
     fanPercent: Number(g.fanPercent ?? 0),
     driverVersion: g.driverVersion,
+    memUtilPercent: g.memUtilPercent ?? null,
+    smClockMHz: g.smClockMHz ?? null,
+    memClockMHz: g.memClockMHz ?? null,
+    pstate: g.pstate ?? null,
+    throttleMask: g.throttleMask ?? null,
+    eccUncorrected: g.eccUncorrected ?? null,
+    pcieGen: g.pcieGen ?? null,
+    pcieWidth: g.pcieWidth ?? null,
   };
 }
 
@@ -37,8 +47,9 @@ export function buildServerView(
   gpuRows: GpuSnapshot[],
   activeAlerts: Alert[],
   offlineAfterSec: number,
+  window?: MaintenanceWindow,
 ): ServerView {
-  const status = computeStatus(server, activeAlerts, offlineAfterSec);
+  const status = computeStatus(server, activeAlerts, offlineAfterSec, Date.now(), !!window);
   const live = status !== "offline" && status !== "pending";
   const gpus = gpuRows.map(toGpuView).sort((a, b) => a.gpuIndex - b.gpuIndex);
   const n = (v: string | number | null | undefined) => (v === null || v === undefined ? null : Number(v));
@@ -51,6 +62,7 @@ export function buildServerView(
     description: server.description,
     location: server.location,
     maintenance: server.maintenance,
+    maintenanceWindow: window ? { endsAt: window.endsAt.toISOString(), reason: window.reason } : null,
     hasOwnKey: !!server.apiKeyHash,
     apiKeyPrefix: server.apiKeyPrefix,
     hostname: server.hostname,
@@ -72,16 +84,18 @@ export function buildServerView(
     totalPowerW: live ? Math.round(gpus.reduce((s, g) => s + g.powerW, 0)) : 0,
     maxGpuTempC: gpus.length ? Math.max(...gpus.map((g) => g.tempC)) : null,
     gpus,
+    processes: server.processes ?? [],
   };
 }
 
 export async function getServerViews(ids?: string[]): Promise<ServerView[]> {
-  const [serverList, sysMap, gpuMap, active, settings] = await Promise.all([
+  const [serverList, sysMap, gpuMap, active, settings, windows] = await Promise.all([
     storage.listServers(),
     storage.latestSysByServer(ids),
     storage.latestGpusByServer(ids),
     storage.getActiveAlerts(),
     storage.getSettings(),
+    getActiveWindows(),
   ]);
   const offlineAfter = Number(settings.offline_after_sec) || 120;
   const alertsByServer = new Map<string, Alert[]>();
@@ -92,7 +106,7 @@ export async function getServerViews(ids?: string[]): Promise<ServerView[]> {
   }
   return serverList
     .filter((s) => !ids || ids.includes(s.id))
-    .map((s) => buildServerView(s, sysMap.get(s.id), gpuMap.get(s.id) ?? [], alertsByServer.get(s.id) ?? [], offlineAfter));
+    .map((s) => buildServerView(s, sysMap.get(s.id), gpuMap.get(s.id) ?? [], alertsByServer.get(s.id) ?? [], offlineAfter, windowFor(s, windows)));
 }
 
 export async function getServerView(id: string): Promise<ServerView | undefined> {

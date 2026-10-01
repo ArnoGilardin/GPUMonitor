@@ -10,12 +10,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Save, Trash2, Plus, Send, Pencil, X } from "lucide-react";
+import { Save, Trash2, Plus, Send, Pencil, X, CalendarClock } from "lucide-react";
+import MaintenanceDialog from "@/components/maintenance-dialog";
 import { apiRequest } from "@/lib/queryClient";
 import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/lib/auth";
 import Header from "@/components/layout/header";
-import { RULE_TYPES, RULE_TYPE_LABELS, type Rule, type RuleType, type ServerView } from "@shared/schema";
+import { RULE_TYPES, RULE_TYPE_LABELS, type MaintenanceWindow, type Rule, type RuleType, type ServerView } from "@shared/schema";
 
 type SettingsResponse = Record<string, string> & { _server: { emailConfigured: boolean; globalKeyEnabled: boolean } };
 
@@ -303,12 +304,13 @@ function RulesTab({ readOnly }: { readOnly: boolean }) {
 
 // ------------------------------------------------------------------ general
 function GeneralTab({ settings, readOnly }: { settings?: SettingsResponse; readOnly: boolean }) {
-  const [form, setForm] = useState({ offline_after_sec: "120", metrics_retention_days: "30", alerts_retention_days: "90" });
+  const [form, setForm] = useState({ offline_after_sec: "120", metrics_retention_days: "14", rollup_retention_days: "365", alerts_retention_days: "90" });
   useEffect(() => {
     if (settings) {
       setForm({
         offline_after_sec: settings.offline_after_sec,
         metrics_retention_days: settings.metrics_retention_days,
+        rollup_retention_days: settings.rollup_retention_days,
         alerts_retention_days: settings.alerts_retention_days,
       });
     }
@@ -324,17 +326,23 @@ function GeneralTab({ settings, readOnly }: { settings?: SettingsResponse; readO
           <Input type="number" min={30} disabled={readOnly} value={form.offline_after_sec} onChange={(e) => setForm({ ...form, offline_after_sec: e.target.value })} data-testid="input-offline-after" />
           <p className="text-sm text-muted-foreground mt-1">Should be a few times the collectors' interval (30 s by default).</p>
         </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
-            <Label>Keep metrics (days)</Label>
-            <Input type="number" min={1} disabled={readOnly} value={form.metrics_retention_days} onChange={(e) => setForm({ ...form, metrics_retention_days: e.target.value })} />
+            <Label>Keep raw metrics (days)</Label>
+            <Input type="number" min={1} disabled={readOnly} value={form.metrics_retention_days} onChange={(e) => setForm({ ...form, metrics_retention_days: e.target.value })} data-testid="input-raw-retention" />
+          </div>
+          <div>
+            <Label>Keep hourly history (days)</Label>
+            <Input type="number" min={7} disabled={readOnly} value={form.rollup_retention_days} onChange={(e) => setForm({ ...form, rollup_retention_days: e.target.value })} data-testid="input-rollup-retention" />
           </div>
           <div>
             <Label>Keep resolved alerts & audit log (days)</Label>
             <Input type="number" min={1} disabled={readOnly} value={form.alerts_retention_days} onChange={(e) => setForm({ ...form, alerts_retention_days: e.target.value })} />
           </div>
         </div>
-        <p className="text-sm text-muted-foreground">Older data is purged automatically every hour.</p>
+        <p className="text-sm text-muted-foreground">
+          Raw samples feed charts up to 48 h; longer ranges use hourly averages, which are tiny. Older data is purged automatically every hour.
+        </p>
         {settings && (
           <p className="text-sm text-muted-foreground">
             Global collector key: {settings._server.globalKeyEnabled ? "enabled (servers can auto-register)" : "disabled, only per-server keys are accepted"}.
@@ -346,6 +354,65 @@ function GeneralTab({ settings, readOnly }: { settings?: SettingsResponse; readO
           </Button>
         )}
       </CardContent>
+    </Card>
+  );
+}
+
+// -------------------------------------------------------------- maintenance
+function MaintenanceTab({ readOnly }: { readOnly: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [showPast, setShowPast] = useState(false);
+  const { data: windows = [] } = useQuery<Array<Omit<MaintenanceWindow, "startsAt" | "endsAt"> & { startsAt: string; endsAt: string }>>({
+    queryKey: ["/api/maintenance-windows", { past: showPast ? "true" : undefined }],
+  });
+  const { data: servers = [] } = useQuery<ServerView[]>({ queryKey: ["/api/servers"] });
+  const end = useSaveMutation((id: string) => apiRequest("DELETE", `/api/maintenance-windows/${id}`), ["/api/maintenance-windows", "/api/servers"], "Maintenance window updated");
+  const now = Date.now();
+
+  return (
+    <Card>
+      <CardHeader className="flex flex-row items-start justify-between gap-4 space-y-0">
+        <div>
+          <CardTitle>Maintenance windows</CardTitle>
+          <CardDescription className="mt-1.5">Planned interventions: matching servers show “Maintenance” and raise no alerts.</CardDescription>
+        </div>
+        {!readOnly && (
+          <Button onClick={() => setOpen(true)} data-testid="add-maintenance"><CalendarClock className="h-4 w-4 mr-2" />Schedule</Button>
+        )}
+      </CardHeader>
+      <CardContent className="space-y-3">
+        <div className="flex items-center gap-2">
+          <Switch id="show-past" checked={showPast} onCheckedChange={setShowPast} />
+          <Label htmlFor="show-past">Show past windows</Label>
+        </div>
+        {windows.length === 0 && <p className="text-center py-8 text-muted-foreground">No maintenance scheduled</p>}
+        {windows.map((w) => {
+          const start = new Date(w.startsAt).getTime();
+          const stop = new Date(w.endsAt).getTime();
+          const state = stop < now ? "past" : start <= now ? "active" : "planned";
+          const target = w.serverId ? servers.find((s) => s.id === w.serverId)?.name ?? w.serverId : w.tag ? `tag “${w.tag}”` : "all servers";
+          return (
+            <div key={w.id} className="flex flex-col sm:flex-row sm:items-center gap-3 p-4 border border-border rounded-lg" data-testid={`maintenance-${w.id}`}>
+              <div className="flex-1 min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-medium">{target}</span>
+                  <Badge variant="outline" className={state === "active" ? "text-chart-4 border-chart-4/40" : state === "planned" ? "" : "text-muted-foreground"}>{state}</Badge>
+                </div>
+                <p className="text-sm text-muted-foreground">
+                  {new Date(w.startsAt).toLocaleString()} → {new Date(w.endsAt).toLocaleString()}
+                  {w.reason ? ` · ${w.reason}` : ""}{w.createdBy ? ` · by ${w.createdBy}` : ""}
+                </p>
+              </div>
+              {!readOnly && state !== "past" && (
+                <Button variant="outline" size="sm" onClick={() => end.mutate(w.id)} data-testid={`end-maintenance-${w.id}`}>
+                  {state === "active" ? "End now" : "Cancel"}
+                </Button>
+              )}
+            </div>
+          );
+        })}
+      </CardContent>
+      <MaintenanceDialog open={open} onOpenChange={setOpen} />
     </Card>
   );
 }
@@ -515,6 +582,7 @@ export default function Settings() {
           <TabsList className="flex-wrap h-auto">
             <TabsTrigger value="notifications" data-testid="tab-notifications">Notifications</TabsTrigger>
             <TabsTrigger value="alert-rules" data-testid="tab-alert-rules">Alert rules</TabsTrigger>
+            <TabsTrigger value="maintenance" data-testid="tab-maintenance">Maintenance</TabsTrigger>
             <TabsTrigger value="general" data-testid="tab-general">General</TabsTrigger>
             {isAdmin && <TabsTrigger value="users" data-testid="tab-users">Users</TabsTrigger>}
             {isAdmin && <TabsTrigger value="audit" data-testid="tab-audit">Audit log</TabsTrigger>}
@@ -522,6 +590,7 @@ export default function Settings() {
           </TabsList>
           <TabsContent value="notifications"><NotificationsTab settings={settings} readOnly={!isAdmin} /></TabsContent>
           <TabsContent value="alert-rules"><RulesTab readOnly={!isAdmin} /></TabsContent>
+          <TabsContent value="maintenance"><MaintenanceTab readOnly={!isAdmin} /></TabsContent>
           <TabsContent value="general"><GeneralTab settings={settings} readOnly={!isAdmin} /></TabsContent>
           {isAdmin && <TabsContent value="users"><UsersTab /></TabsContent>}
           {isAdmin && <TabsContent value="audit"><AuditTab /></TabsContent>}

@@ -28,6 +28,17 @@ describe("metricValue", () => {
     expect(metricValue("disk_util", sample)).toBe(77);
     expect(metricValue("load1", sample)).toBe(12.5);
   });
+  it("reads ECC errors and counts throttled GPUs", () => {
+    const gpus = [
+      { ...sample.gpus[0], eccUncorrected: 0, throttleMask: 0x40 },
+      { ...sample.gpus[1], eccUncorrected: 3, throttleMask: 0x4 },
+    ];
+    expect(metricValue("gpu_ecc_errors", { sys: null, gpus })).toBe(3);
+    // power cap (0x4) is normal operation, HW thermal (0x40) is a problem
+    expect(metricValue("gpu_throttling", { sys: null, gpus })).toBe(1);
+    expect(metricValue("gpu_ecc_errors", sample)).toBeUndefined();
+    expect(metricValue("gpu_throttling", sample)).toBeUndefined();
+  });
   it("returns undefined without data", () => {
     expect(metricValue("gpu_temp", { sys: null, gpus: [] })).toBeUndefined();
     expect(metricValue("cpu_util", { sys: null, gpus: [] })).toBeUndefined();
@@ -83,7 +94,7 @@ describe("BreachTracker", () => {
 describe("alertMessage", () => {
   it("describes metric breaches with units", () => {
     expect(alertMessage({ type: "gpu_temp", threshold: "80" }, 84.26)).toBe(
-      "GPU temperature (max) is 84.3°C, above threshold of 80°C",
+      "GPU temperature (max) is 84.3°C (threshold 80°C)",
     );
   });
   it("describes offline servers with durations", () => {
