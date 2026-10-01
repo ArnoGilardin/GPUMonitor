@@ -1,31 +1,29 @@
-version: '3.8'
-
 services:
   # Main application (API + Frontend)
   gpu-monitor:
     build: .
     container_name: gpu-monitor-central
     restart: unless-stopped
-    # Port exposed internally only - use Nginx reverse proxy for external access
-    expose:
-      - "5100"
+    # Published on localhost only; use the nginx profile (or your own reverse proxy) for external access
+    ports:
+      - "127.0.0.1:${APP_PORT:-5100}:5100"
     environment:
       - NODE_ENV=production
       - PORT=5100
       - DATABASE_URL=${DATABASE_URL}
       - JWT_SECRET=${JWT_SECRET}
       - REFRESH_TOKEN_SECRET=${REFRESH_TOKEN_SECRET}
-      - SESSION_SECRET=${SESSION_SECRET}
       - COLLECTOR_API_KEY=${COLLECTOR_API_KEY}
       - SENDGRID_API_KEY=${SENDGRID_API_KEY}
       - SENDGRID_FROM_EMAIL=${SENDGRID_FROM_EMAIL}
       - ADMIN_USERNAME=${ADMIN_USERNAME}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - ALLOW_REGISTRATION=${ALLOW_REGISTRATION:-false}
+      - REQUIRE_SERVER_KEYS=${REQUIRE_SERVER_KEYS:-false}
+      - DB_AUTO_MIGRATE=${DB_AUTO_MIGRATE:-true}
       - TRUST_PROXY=${TRUST_PROXY:-true}
       - FRONTEND_URL=${FRONTEND_URL}
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
+      - METRICS_TOKEN=${METRICS_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,25 +59,25 @@ services:
     networks:
       - gpu-monitor-network
 
-  # Redis for session storage (optional)
-  # NOT exposed to host - only accessible via Docker network
-  redis:
-    image: redis:7-alpine
-    container_name: gpu-monitor-redis
+  # Demo: 6 simulated GPU servers reporting with the global collector key.
+  #   docker compose --profile demo up -d
+  simulator:
+    build: .
+    container_name: gpu-monitor-simulator
     restart: unless-stopped
-    # No port mapping - internal network only
-    expose:
-      - "6379"
+    entrypoint: []
+    command: ["npx", "--yes", "tsx", "scripts/simulate.ts", "--url", "http://gpu-monitor:5100", "--servers", "6", "--interval", "15"]
+    environment:
+      - CENTRAL_API_KEY=${COLLECTOR_API_KEY}
     volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes
+      - ./scripts/simulate.ts:/app/scripts/simulate.ts:ro
+    depends_on:
+      gpu-monitor:
+        condition: service_healthy
     networks:
       - gpu-monitor-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+    profiles:
+      - demo
 
   # Nginx reverse proxy
   # Comment out or remove if using external reverse proxy (Caddy, Traefik, etc.)
@@ -108,7 +106,6 @@ services:
 
 volumes:
   postgres_data:
-  redis_data:
 
 networks:
   gpu-monitor-network:

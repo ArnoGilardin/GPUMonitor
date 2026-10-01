@@ -1,122 +1,80 @@
 import { WebSocketServer, WebSocket } from "ws";
 import type { Server } from "http";
-import jwt from "jsonwebtoken";
-import { storage } from "./storage";
+import { verifyAccessToken } from "./auth";
+import { events, type MonitorEvent } from "./services/events";
 
-const JWT_SECRET = process.env.JWT_SECRET || "development-secret-key";
-
-interface AuthenticatedWebSocket extends WebSocket {
+interface ClientSocket extends WebSocket {
   userId?: string;
-  serverId?: string;
+  isAlive?: boolean;
 }
 
+/**
+ * Pushes lightweight invalidation events to the browser. Clients refetch
+ * what they display, so no heavy payload is computed per broadcast.
+ */
 export function setupWebSocket(server: Server) {
-  const wss = new WebSocketServer({ 
-    server, 
+  const wss = new WebSocketServer({
+    server,
     path: "/ws",
     verifyClient: (info: any) => {
       const url = new URL(info.req.url!, `http://${info.req.headers.host}`);
       const token = url.searchParams.get("token");
-      
-      if (!token) {
-        return false;
-      }
-
-      try {
-        jwt.verify(token, JWT_SECRET);
-        return true;
-      } catch {
-        return false;
-      }
-    }
+      return !!token && !!verifyAccessToken(token);
+    },
   });
 
-  wss.on("connection", (ws: AuthenticatedWebSocket, req) => {
+  wss.on("connection", (ws: ClientSocket, req) => {
     const url = new URL(req.url!, `http://${req.headers.host}`);
-    const token = url.searchParams.get("token");
-    const serverId = url.searchParams.get("serverId");
-
-    if (token) {
-      try {
-        const decoded = jwt.verify(token, JWT_SECRET) as { userId: string };
-        ws.userId = decoded.userId;
-        ws.serverId = serverId || undefined;
-      } catch {
-        ws.close(1008, "Invalid token");
-        return;
-      }
+    const decoded = verifyAccessToken(url.searchParams.get("token") || "");
+    if (!decoded) {
+      ws.close(1008, "Invalid token");
+      return;
     }
-
-    ws.on("message", (message) => {
-      try {
-        const data = JSON.parse(message.toString());
-        
-        if (data.type === "subscribe") {
-          ws.serverId = data.serverId;
-        }
-      } catch (error) {
-        console.error("WebSocket message error:", error);
-      }
-    });
-
-    ws.on("close", () => {
-      console.log("WebSocket client disconnected");
-    });
-
+    ws.userId = decoded.userId;
+    ws.isAlive = true;
+    ws.on("pong", () => { ws.isAlive = true; });
+    ws.on("error", (err) => console.error("WebSocket client error:", err.message));
     ws.send(JSON.stringify({ type: "connected", timestamp: new Date().toISOString() }));
   });
 
-  // Broadcast updates to connected clients with throttling
-  let lastBroadcastData: any = null;
-  let broadcastTimer: NodeJS.Timeout;
-  
-  const broadcastUpdates = async () => {
-    // Skip if no clients connected
-    if (wss.clients.size === 0) {
-      return;
-    }
+  // Coalesce metric events: at most one "metrics" push every 2 seconds, listing changed servers
+  let pendingServers = new Set<string>();
+  let flushTimer: NodeJS.Timeout | null = null;
 
-    try {
-      const servers = await storage.getServersWithMetrics();
-      const stats = await storage.getStats();
-
-      // Cache data to avoid duplicate DB queries
-      const currentData = JSON.stringify({ servers, stats });
-      if (currentData === lastBroadcastData) {
-        return; // No changes, skip broadcast
-      }
-      
-      lastBroadcastData = currentData;
-
-      wss.clients.forEach((client: AuthenticatedWebSocket) => {
-        if (client.readyState === WebSocket.OPEN) {
-          const message = {
-            type: "update",
-            timestamp: new Date().toISOString(),
-            data: {
-              servers: client.serverId ?
-                servers.filter(s => s.id === client.serverId) :
-                servers,
-              stats,
-            }
-          };
-          
-          client.send(JSON.stringify(message));
-        }
-      });
-    } catch (error) {
-      console.error("WebSocket broadcast error:", error);
-    }
+  const broadcast = (message: object) => {
+    const data = JSON.stringify({ ...message, timestamp: new Date().toISOString() });
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) client.send(data);
+    });
   };
-  
-  // Broadcast every 10 seconds
-  broadcastTimer = setInterval(broadcastUpdates, 10000);
-  
-  // Cleanup on server shutdown
-  wss.on('close', () => {
-    if (broadcastTimer) {
-      clearInterval(broadcastTimer);
+
+  const unsubscribe = events.onEvent((event: MonitorEvent) => {
+    if (event.type === "metrics") {
+      pendingServers.add(event.serverId);
+      if (!flushTimer) {
+        flushTimer = setTimeout(() => {
+          broadcast({ type: "metrics", serverIds: Array.from(pendingServers) });
+          pendingServers = new Set();
+          flushTimer = null;
+        }, 2000);
+      }
+    } else {
+      broadcast(event);
     }
+  });
+
+  // Drop dead connections
+  const heartbeat = setInterval(() => {
+    wss.clients.forEach((client: ClientSocket) => {
+      if (client.isAlive === false) return client.terminate();
+      client.isAlive = false;
+      client.ping();
+    });
+  }, 30000);
+
+  wss.on("close", () => {
+    clearInterval(heartbeat);
+    unsubscribe();
   });
 
   return wss;

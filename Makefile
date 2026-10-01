@@ -1,4 +1,4 @@
-.PHONY: help dev build clean test lint format install docker-build docker-run docker-push compose-up compose-down migrate seed
+.PHONY: help dev build clean test lint format install docker-build docker-run docker-push compose-up compose-down migrate simulate test-e2e
 
 # Default target
 help: ## Show this help message
@@ -24,26 +24,32 @@ clean: ## Clean build artifacts
 	rm -rf client/dist/
 
 ##@ Database
-migrate: ## Run database migrations
-	npm run db:push
+migrate: ## Apply database migrations
+	npm run db:migrate
 
-seed: ## Seed database with sample data
-	@echo "Seeding database..."
-	@node -e "console.log('Database seeded successfully')"
+migration: ## Generate a migration after editing shared/schema.ts
+	npm run db:generate
+
+simulate: ## Send metrics from simulated GPU servers (SERVERS=6)
+	npm run simulate -- --servers $(or $(SERVERS),6)
 
 ##@ Building
 build: ## Build the application
 	npm run build
 
-test: ## Run tests
-	@echo "No tests configured yet"
+test: ## Run unit tests (TypeScript + collector)
+	npm test
+	cd collector && python3 -m unittest test_collector
+
+test-e2e: ## Run Playwright end-to-end tests (needs a dev database)
+	npx playwright test
 
 ##@ Docker
 docker-build: ## Build Docker image
 	docker build -t gpu-monitor:latest .
 
 docker-run: ## Run Docker container
-	docker run -p 5000:5000 --env-file .env gpu-monitor:latest
+	docker run -p 5100:5100 --env-file .env gpu-monitor:latest
 
 docker-push: ## Push Docker image (set REGISTRY variable)
 	@if [ -z "$(REGISTRY)" ]; then echo "Please set REGISTRY variable: make docker-push REGISTRY=your-registry.com"; exit 1; fi
@@ -52,26 +58,29 @@ docker-push: ## Push Docker image (set REGISTRY variable)
 
 ##@ Docker Compose
 compose-up: ## Start services with Docker Compose
-	docker-compose up -d
+	docker compose up -d
+
+compose-demo: ## Start services plus 6 simulated GPU servers
+	docker compose --profile demo up -d
 
 compose-down: ## Stop services
-	docker-compose down
+	docker compose down
 
 compose-logs: ## Show logs
-	docker-compose logs -f
+	docker compose logs -f
 
 compose-build: ## Build and start services
-	docker-compose up -d --build
+	docker compose up -d --build
 
 ##@ Collector
 collector-build: ## Build collector Docker image
 	cd collector && docker build -t gpu-monitor-collector:latest .
 
 collector-run: ## Run collector container
-	cd collector && docker-compose up -d
+	cd collector && docker compose up -d
 
 collector-logs: ## Show collector logs
-	cd collector && docker-compose logs -f
+	cd collector && docker compose logs -f
 
 ##@ Production
 deploy: build docker-build ## Build and prepare for deployment
@@ -106,4 +115,4 @@ status: ## Show system status
 	@echo "Node version: $$(node --version)"
 	@echo "NPM version: $$(npm --version)"
 	@echo "Docker version: $$(docker --version 2>/dev/null || echo 'Docker not installed')"
-	@echo "Database status: $$(npm run db:push --dry-run 2>/dev/null && echo 'OK' || echo 'Not configured')"
+	@echo "Database: $$(curl -sf http://localhost:$${PORT:-5100}/health >/dev/null && echo 'OK (app healthy)' || echo 'app not running')"

@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Typecheck, unit tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - name: Migrations match the schema
+        run: |
+          npx drizzle-kit generate --name ci-drift-check
+          if [ -n "$(git status --porcelain migrations)" ]; then
+            echo "::error::shared/schema.ts changed without a migration. Run 'npm run db:generate' and commit the result."
+            git status --porcelain migrations
+            exit 1
+          fi
+
+  collector:
+    name: Collector tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r collector/requirements.txt
+      - run: python -m unittest test_collector -v
+        working-directory: collector
+
+  e2e:
+    name: End-to-end (Playwright + PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gpumon
+          POSTGRES_PASSWORD: gpumon
+          POSTGRES_DB: gpumon
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U gpumon"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://gpumon:gpumon@localhost:5432/gpumon
+      PORT: 5100
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Start the app (applies migrations, creates admin/admin)
+        run: |
+          npm run dev > app.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:5100/health && break; sleep 2; done
+          curl -sf http://localhost:5100/health
+      - name: Simulated fleet
+        run: npm run simulate -- --servers 4 --once
+      - run: npx playwright test
+      - name: App logs
+        if: failure()
+        run: cat app.log
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: test-results/
+          retention-days: 7
+
+  docker:
+    name: Docker images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Central server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: gpu-monitor:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Collector image
+        uses: docker/build-push-action@v6
+        with:
+          context: collector
+          push: false
+          tags: gpu-monitor-collector:ci

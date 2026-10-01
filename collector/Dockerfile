@@ -1,38 +1,22 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
+# nvidia-smi is injected at runtime by the NVIDIA Container Toolkit (--gpus all);
+# for AMD GPUs, mount rocm-smi or use the native (systemd) install instead.
 WORKDIR /app
 
-# Install system dependencies for GPU monitoring
-RUN apt-get update && apt-get install -y \
-    procps \
-    lsb-release \
-    curl \
-    gnupg2 \
-    software-properties-common \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install NVIDIA drivers and tools (will be no-op if no GPU)
-RUN curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub | apt-key add - && \
-    echo "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64 /" > /etc/apt/sources.list.d/cuda.list && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends nvidia-utils-535 || true && \
-    rm -rf /var/lib/apt/lists/*
-
-# Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy collector script
 COPY collector.py .
 
-# Create non-root user
-RUN useradd -m -u 1000 collector && \
-    chown -R collector:collector /app
-
+RUN useradd -m -u 1000 collector && chown -R collector:collector /app
 USER collector
 
-# Health check
-HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=5)" || exit 1
+ENV PYTHONUNBUFFERED=1 \
+    HEARTBEAT_FILE=/tmp/gpu-monitor-collector.heartbeat
+
+# Healthy when a report was accepted during the last 5 minutes
+HEALTHCHECK --interval=60s --timeout=5s --start-period=60s --retries=3 \
+    CMD python -c "import os,sys,time; f=os.environ['HEARTBEAT_FILE']; sys.exit(0 if os.path.exists(f) and time.time()-os.path.getmtime(f) < 300 else 1)"
 
 CMD ["python", "collector.py"]

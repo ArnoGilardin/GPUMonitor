@@ -1,176 +1,112 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { Link } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { Search, Filter, Plus } from "lucide-react";
-import AlertItem from "@/components/alert-item";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Search, BellOff, Settings2 } from "lucide-react";
+import AlertItem, { type AlertView } from "@/components/alert-item";
 import Header from "@/components/layout/header";
+import { useAuth } from "@/lib/auth";
+
+type Status = "active" | "resolved" | "all";
 
 export default function Alerts() {
-  const [filter, setFilter] = useState("all");
+  const { isAdmin } = useAuth();
+  const [status, setStatus] = useState<Status>("active");
+  const [level, setLevel] = useState("all");
   const [search, setSearch] = useState("");
-  const [showResolved, setShowResolved] = useState(false);
 
-  const { data: alerts = [] } = useQuery({
-    queryKey: ["/api/alerts"],
-    refetchInterval: 10000,
-  });
+  const { data: alerts = [] } = useQuery<AlertView[]>({ queryKey: ["/api/alerts", { status, limit: 500 }], refetchInterval: 60000 });
+  const { data: active = [] } = useQuery<AlertView[]>({ queryKey: ["/api/alerts", { status: "active", limit: 500 }], refetchInterval: 60000 });
 
-  const filteredAlerts = alerts.filter((alert: any) => {
-    // Filter by resolved status
-    if (!showResolved && alert.resolvedAt) return false;
-    if (showResolved && !alert.resolvedAt) return false;
-    
-    // Filter by level
-    if (filter !== "all" && alert.level !== filter) return false;
-    
-    // Filter by search term
-    if (search && !alert.message.toLowerCase().includes(search.toLowerCase()) && 
-        !alert.server?.name.toLowerCase().includes(search.toLowerCase())) {
-      return false;
+  const filtered = useMemo(() => alerts.filter((a) => {
+    if (level !== "all" && a.level !== level) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      return [a.message, a.server?.name, a.rule?.name, a.serverId].some((v) => v?.toLowerCase().includes(q));
     }
-    
     return true;
-  });
+  }), [alerts, level, search]);
 
-  const alertStats = {
-    total: alerts.length,
-    active: alerts.filter((a: any) => !a.resolvedAt).length,
-    critical: alerts.filter((a: any) => !a.resolvedAt && a.level === "critical").length,
-    warning: alerts.filter((a: any) => !a.resolvedAt && a.level === "warning").length,
+  const stats = {
+    active: active.length,
+    critical: active.filter((a) => a.level === "critical").length,
+    warning: active.filter((a) => a.level === "warning").length,
+    unacked: active.filter((a) => !a.acknowledgedAt).length,
   };
 
   return (
-    <div className="bg-background">
-      <Header 
+    <div className="bg-background min-h-full">
+      <Header
         title="Alerts"
-        subtitle="Monitor and manage system alerts"
+        subtitle="Alerts fire when a rule's condition holds for its duration and resolve automatically when it clears"
+        actions={isAdmin && (
+          <Button variant="outline" asChild data-testid="create-rule-button">
+            <Link href="/settings?tab=alert-rules"><Settings2 className="h-4 w-4 md:mr-2" /><span className="hidden md:inline">Alert rules</span></Link>
+          </Button>
+        )}
       />
-      
-      <div className="p-6">
-        {/* Alert Stats */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-          <Card>
-            <CardContent className="p-6">
-              <div className="text-center">
-                <p className="text-2xl font-bold text-foreground">{alertStats.total}</p>
-                <p className="text-sm text-muted-foreground">Total Alerts</p>
-              </div>
-            </CardContent>
-          </Card>
-          
-          <Card>
-            <CardContent className="p-6">
-              <div className="text-center">
-                <p className="text-2xl font-bold text-primary">{alertStats.active}</p>
-                <p className="text-sm text-muted-foreground">Active Alerts</p>
-              </div>
-            </CardContent>
-          </Card>
-          
-          <Card>
-            <CardContent className="p-6">
-              <div className="text-center">
-                <p className="text-2xl font-bold text-destructive">{alertStats.critical}</p>
-                <p className="text-sm text-muted-foreground">Critical</p>
-              </div>
-            </CardContent>
-          </Card>
-          
-          <Card>
-            <CardContent className="p-6">
-              <div className="text-center">
-                <p className="text-2xl font-bold text-warning">{alertStats.warning}</p>
-                <p className="text-sm text-muted-foreground">Warning</p>
-              </div>
-            </CardContent>
-          </Card>
+
+      <div className="p-4 md:p-6 space-y-6">
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {[
+            ["Active", stats.active, "text-foreground"],
+            ["Critical", stats.critical, "text-error"],
+            ["Warning", stats.warning, "text-warning"],
+            ["Not acknowledged", stats.unacked, "text-foreground"],
+          ].map(([label, value, cls]) => (
+            <Card key={label as string}>
+              <CardContent className="p-5 text-center">
+                <p className={`text-2xl font-bold ${cls}`}>{value}</p>
+                <p className="text-sm text-muted-foreground">{label}</p>
+              </CardContent>
+            </Card>
+          ))}
         </div>
 
-        {/* Filters and Controls */}
-        <Card className="mb-6">
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <CardTitle>Alert Management</CardTitle>
-              <Button data-testid="create-rule-button">
-                <Plus className="h-4 w-4 mr-2" />
-                Create Rule
-              </Button>
+        <Card>
+          <CardHeader className="space-y-4">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <CardTitle className="flex items-center gap-2">
+                Alerts <Badge variant="outline">{filtered.length}</Badge>
+              </CardTitle>
+              <Tabs value={status} onValueChange={(v) => setStatus(v as Status)}>
+                <TabsList>
+                  <TabsTrigger value="active" data-testid="tab-active">Active</TabsTrigger>
+                  <TabsTrigger value="resolved" data-testid="toggle-resolved">Resolved</TabsTrigger>
+                  <TabsTrigger value="all">All</TabsTrigger>
+                </TabsList>
+              </Tabs>
             </div>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap items-center gap-4">
-              {/* Search */}
-              <div className="relative flex-1 min-w-64">
-                <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-muted-foreground h-4 w-4" />
-                <Input
-                  placeholder="Search alerts..."
-                  value={search}
-                  onChange={(e) => setSearch(e.target.value)}
-                  className="pl-10"
-                  data-testid="search-alerts"
-                />
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="relative flex-1 min-w-56">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground h-4 w-4" />
+                <Input placeholder="Search by server, rule or message…" value={search} onChange={(e) => setSearch(e.target.value)} className="pl-10" data-testid="search-alerts" />
               </div>
-              
-              {/* Level Filter */}
-              <Select value={filter} onValueChange={setFilter}>
-                <SelectTrigger className="w-40" data-testid="filter-level">
-                  <SelectValue placeholder="Filter by level" />
-                </SelectTrigger>
+              <Select value={level} onValueChange={setLevel}>
+                <SelectTrigger className="w-40" data-testid="filter-level"><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="all">All Levels</SelectItem>
+                  <SelectItem value="all">All levels</SelectItem>
                   <SelectItem value="critical">Critical</SelectItem>
                   <SelectItem value="warning">Warning</SelectItem>
                 </SelectContent>
               </Select>
-              
-              {/* Show Resolved Toggle */}
-              <div className="flex items-center space-x-2">
-                <Button
-                  variant={showResolved ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => setShowResolved(!showResolved)}
-                  data-testid="toggle-resolved"
-                >
-                  {showResolved ? "Show Active" : "Show Resolved"}
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Alerts List */}
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <CardTitle>
-                {showResolved ? "Resolved Alerts" : "Active Alerts"} 
-                <Badge variant="outline" className="ml-2">
-                  {filteredAlerts.length}
-                </Badge>
-              </CardTitle>
             </div>
           </CardHeader>
           <CardContent>
-            <div className="space-y-4" data-testid="alerts-list">
-              {filteredAlerts.length === 0 ? (
+            <div className="space-y-3" data-testid="alerts-list">
+              {filtered.length === 0 ? (
                 <div className="text-center py-12">
-                  <Filter className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-                  <p className="text-lg font-medium text-foreground">No alerts found</p>
-                  <p className="text-muted-foreground">
-                    {showResolved 
-                      ? "No resolved alerts match your filters"
-                      : "No active alerts match your filters"
-                    }
-                  </p>
+                  <BellOff className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+                  <p className="text-lg font-medium text-foreground">No alerts</p>
+                  <p className="text-muted-foreground">{status === "active" ? "Everything looks healthy." : "Nothing matches these filters."}</p>
                 </div>
               ) : (
-                filteredAlerts.map((alert: any) => (
-                  <AlertItem key={alert.id} alert={alert} />
-                ))
+                filtered.map((alert) => <AlertItem key={alert.id} alert={alert} />)
               )}
             </div>
           </CardContent>

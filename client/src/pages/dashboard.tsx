@@ -1,312 +1,219 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
+import { Link, useSearch, useLocation } from "wouter";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Badge } from "@/components/ui/badge";
-import { RefreshCw, Cpu, HardDrive, Zap, AlertTriangle, TrendingUp, TrendingDown } from "lucide-react";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Cpu, Server as ServerIcon, Zap, AlertTriangle, Activity, MemoryStick, Plus, Search, X } from "lucide-react";
 import ServerCard from "@/components/server-card";
-import ServerModal from "@/components/server-modal";
-import AlertItem from "@/components/alert-item";
-import { useWebSocket } from "@/hooks/use-websocket";
-import { useToast } from "@/hooks/use-toast";
-import type { Server, Alert } from "@shared/schema";
+import AlertItem, { type AlertView } from "@/components/alert-item";
+import Header from "@/components/layout/header";
+import MetricChart from "@/components/charts/metric-chart";
+import { useAuth } from "@/lib/auth";
+import { cn } from "@/lib/utils";
+import type { FleetStats, ServerView } from "@shared/schema";
 
-// Extended types for dashboard data
-interface DashboardServer extends Omit<Server, 'id' | 'createdAt'> {
-  id: string;
-  status: "online" | "offline" | "warning" | "error";
-  cpuPercent?: number;
-  ramPercent?: number;
-  gpuUtil?: number;
-  lastSeenAt?: Date | null;
-  gpus?: Array<{
-    name: string;
-    tempC: number;
-    powerW: number;
-  }>;
+type StatusFilter = "all" | "online" | "problems" | "offline";
+
+function StatCard({ label, value, sub, icon: Icon, tone = "default", testId }: {
+  label: string;
+  value: React.ReactNode;
+  sub?: React.ReactNode;
+  icon: typeof Cpu;
+  tone?: "default" | "danger" | "warning" | "success";
+  testId?: string;
+}) {
+  const toneClass = { default: "text-chart-1 bg-chart-1/15", danger: "text-error bg-error/15", warning: "text-warning bg-warning/15", success: "text-success bg-success/15" }[tone];
+  return (
+    <Card>
+      <CardContent className="p-5">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-muted-foreground text-sm">{label}</p>
+            <p className={cn("text-2xl md:text-3xl font-bold mt-1", tone === "danger" ? "text-error" : "text-foreground")} data-testid={testId}>{value}</p>
+          </div>
+          <div className={cn("w-11 h-11 rounded-lg hidden sm:flex items-center justify-center shrink-0", toneClass)}>
+            <Icon className="h-5 w-5" />
+          </div>
+        </div>
+        {sub && <p className="mt-3 text-xs text-muted-foreground">{sub}</p>}
+      </CardContent>
+    </Card>
+  );
 }
 
-interface DashboardStats {
-  totalServers: string | number;
-  onlineServers: string | number;
-  totalGpus: string | number;
-  avgGpuUtil: string | number;
-  totalPowerKW: string | number;
+export function matchesSearch(server: ServerView, q: string) {
+  if (!q) return true;
+  const needle = q.toLowerCase();
+  return [server.name, server.id, server.hostname, server.location, server.ip, ...server.tags, ...server.gpus.map((g) => g.name)]
+    .some((v) => v?.toLowerCase().includes(needle));
 }
 
 export default function Dashboard() {
-  const [filter, setFilter] = useState("all");
-  const [sortBy, setSortBy] = useState("name");
-  const [selectedServerId, setSelectedServerId] = useState<string | null>(null);
-  const { toast } = useToast();
+  const searchString = useSearch();
+  const [, navigate] = useLocation();
+  const q = new URLSearchParams(searchString).get("q") ?? "";
+  const { isAdmin } = useAuth();
+  const [filter, setFilter] = useState<StatusFilter>("all");
+  const [tag, setTag] = useState<string>("all");
+  const [sortBy, setSortBy] = useState("status");
 
-  const { data: servers = [], refetch: refetchServers } = useQuery<DashboardServer[]>({
-    queryKey: ["/api/servers"],
-    refetchInterval: 30000,
+  const { data: servers, isLoading } = useQuery<ServerView[]>({ queryKey: ["/api/servers"], refetchInterval: 60000 });
+  const { data: stats } = useQuery<FleetStats>({ queryKey: ["/api/stats"], refetchInterval: 60000 });
+  const { data: tags = [] } = useQuery<string[]>({ queryKey: ["/api/tags"] });
+  const { data: fleetHistory = [] } = useQuery<Array<Record<string, number | string | null>>>({
+    queryKey: ["/api/fleet/history", { hours: 24 }],
+    refetchInterval: 300000,
   });
+  const { data: recentAlerts = [] } = useQuery<AlertView[]>({ queryKey: ["/api/alerts", { status: "active", limit: 5 }], refetchInterval: 60000 });
 
-  const { data: stats = {} as DashboardStats } = useQuery<DashboardStats>({
-    queryKey: ["/api/stats"],
-    refetchInterval: 30000,
-  });
+  const statusRank: Record<string, number> = { error: 0, warning: 1, offline: 2, online: 3, pending: 4, maintenance: 5 };
 
-  const { data: alerts = [] } = useQuery<Alert[]>({
-    queryKey: ["/api/alerts"],
-    refetchInterval: 10000,
-  });
-
-  // WebSocket for real-time updates
-  useWebSocket({
-    onMessage: (message) => {
-      if (message.type === "update") {
-        refetchServers();
-      }
-    },
-    onError: (error) => {
-      console.error("WebSocket error:", error);
-    },
-  });
-
-  const filteredServers = servers.filter((server) => {
-    if (filter === "all") return true;
-    return server.status === filter;
-  });
-
-  const sortedServers = [...filteredServers].sort((a, b) => {
-    switch (sortBy) {
-      case "name":
-        return a.name.localeCompare(b.name);
-      case "status":
-        return a.status.localeCompare(b.status);
-      case "lastSeen":
-        return new Date(b.lastSeenAt || 0).getTime() - new Date(a.lastSeenAt || 0).getTime();
-      default:
-        return 0;
-    }
-  });
-
-  const activeAlerts = alerts.filter((alert) => !alert.resolvedAt);
-  const recentAlerts = alerts.slice(0, 3);
-
-  const handleRefresh = async () => {
-    await refetchServers();
-    toast({
-      title: "Refreshed",
-      description: "Server data has been updated",
+  const visible = useMemo(() => {
+    const list = (servers ?? []).filter((s) => {
+      if (filter === "online" && !["online", "warning", "error"].includes(s.status)) return false;
+      if (filter === "problems" && !["warning", "error", "offline"].includes(s.status)) return false;
+      if (filter === "offline" && s.status !== "offline") return false;
+      if (tag !== "all" && !s.tags.includes(tag)) return false;
+      return matchesSearch(s, q);
     });
-  };
+    return list.sort((a, b) => {
+      switch (sortBy) {
+        case "gpu": return (b.gpuUtil ?? -1) - (a.gpuUtil ?? -1);
+        case "temp": return (b.maxGpuTempC ?? -1) - (a.maxGpuTempC ?? -1);
+        case "power": return b.totalPowerW - a.totalPowerW;
+        case "name": return a.name.localeCompare(b.name);
+        default: return statusRank[a.status] - statusRank[b.status] || a.name.localeCompare(b.name);
+      }
+    });
+  }, [servers, filter, tag, q, sortBy]);
 
-  const handleServerClick = (serverId: string) => {
-    setSelectedServerId(serverId);
-  };
+  const counts = useMemo(() => {
+    const list = servers ?? [];
+    return {
+      all: list.length,
+      online: list.filter((s) => ["online", "warning", "error"].includes(s.status)).length,
+      problems: list.filter((s) => ["warning", "error", "offline"].includes(s.status)).length,
+      offline: list.filter((s) => s.status === "offline").length,
+    };
+  }, [servers]);
+
+  const filters: Array<[StatusFilter, string]> = [["all", "All"], ["online", "Online"], ["problems", "Needs attention"], ["offline", "Offline"]];
 
   return (
-    <div className="p-6 bg-background">
-      {/* Stats Overview */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-muted-foreground text-sm">Total GPUs</p>
-                <p className="text-3xl font-bold text-foreground" data-testid="stat-total-gpus">
-                  {stats.totalGpus || 0}
-                </p>
-              </div>
-              <div className="w-12 h-12 bg-chart-1/20 rounded-lg flex items-center justify-center">
-                <Cpu className="h-6 w-6 text-chart-1" />
-              </div>
-            </div>
-            <div className="mt-4 flex items-center text-sm">
-              <TrendingUp className="h-4 w-4 text-success mr-1" />
-              <span className="text-success">12%</span>
-              <span className="text-muted-foreground ml-1">from last month</span>
-            </div>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-muted-foreground text-sm">Avg GPU Util</p>
-                <p className="text-3xl font-bold text-foreground" data-testid="stat-avg-gpu-util">
-                  {stats.avgGpuUtil || 0}%
-                </p>
-              </div>
-              <div className="w-12 h-12 bg-chart-2/20 rounded-lg flex items-center justify-center">
-                <TrendingUp className="h-6 w-6 text-chart-2" />
-              </div>
-            </div>
-            <div className="mt-4 flex items-center text-sm">
-              <TrendingUp className="h-4 w-4 text-success mr-1" />
-              <span className="text-success">5%</span>
-              <span className="text-muted-foreground ml-1">from yesterday</span>
-            </div>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-muted-foreground text-sm">Critical Alerts</p>
-                <p className="text-3xl font-bold text-destructive" data-testid="stat-critical-alerts">
-                  {activeAlerts.filter((alert: any) => alert.level === "critical").length}
-                </p>
-              </div>
-              <div className="w-12 h-12 bg-destructive/20 rounded-lg flex items-center justify-center">
-                <AlertTriangle className="h-6 w-6 text-destructive" />
-              </div>
-            </div>
-            <div className="mt-4 flex items-center text-sm">
-              <TrendingDown className="h-4 w-4 text-success mr-1" />
-              <span className="text-success">3</span>
-              <span className="text-muted-foreground ml-1">resolved today</span>
-            </div>
-          </CardContent>
-        </Card>
-        
-        <Card>
-          <CardContent className="p-6">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-muted-foreground text-sm">Power Usage</p>
-                <p className="text-3xl font-bold text-foreground" data-testid="stat-total-power">
-                  {stats.totalPowerKW || 0}kW
-                </p>
-              </div>
-              <div className="w-12 h-12 bg-chart-3/20 rounded-lg flex items-center justify-center">
-                <Zap className="h-6 w-6 text-chart-3" />
-              </div>
-            </div>
-            <div className="mt-4 flex items-center text-sm">
-              <TrendingUp className="h-4 w-4 text-warning mr-1" />
-              <span className="text-warning">8%</span>
-              <span className="text-muted-foreground ml-1">from last week</span>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Filters */}
-      <div className="flex items-center justify-between mb-6">
-        <div className="flex items-center space-x-4">
-          <h3 className="text-lg font-semibold text-foreground">Servers</h3>
-          <div className="flex items-center space-x-2">
-            <Button
-              variant={filter === "all" ? "default" : "ghost"}
-              size="sm"
-              onClick={() => setFilter("all")}
-              data-testid="filter-all"
-            >
-              All
-            </Button>
-            <Button
-              variant={filter === "online" ? "default" : "ghost"}
-              size="sm"
-              onClick={() => setFilter("online")}
-              data-testid="filter-online"
-            >
-              Online
-            </Button>
-            <Button
-              variant={filter === "warning" ? "default" : "ghost"}
-              size="sm"
-              onClick={() => setFilter("warning")}
-              data-testid="filter-warning"
-            >
-              Warning
-            </Button>
-            <Button
-              variant={filter === "error" ? "default" : "ghost"}
-              size="sm"
-              onClick={() => setFilter("error")}
-              data-testid="filter-critical"
-            >
-              Critical
-            </Button>
-          </div>
+    <div className="bg-background min-h-full">
+      <Header title="Dashboard" subtitle="Live overview of your GPU fleet" />
+      <div className="p-4 md:p-6 space-y-6">
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+          <StatCard label="Servers online" icon={ServerIcon} tone={stats && stats.offlineServers > 0 ? "warning" : "success"} testId="stat-online"
+            value={`${stats?.onlineServers ?? 0}/${stats?.totalServers ?? 0}`}
+            sub={stats?.offlineServers ? `${stats.offlineServers} offline` : "All reporting servers are up"} />
+          <StatCard label="GPUs" icon={Cpu} testId="stat-total-gpus" value={stats?.totalGpus ?? 0}
+            sub={stats?.totalVramGB ? `${stats.totalVramUsedGB} / ${stats.totalVramGB} GB VRAM in use` : "No GPU reported yet"} />
+          <StatCard label="Avg GPU utilization" icon={Activity} testId="stat-avg-gpu-util" value={`${stats?.avgGpuUtil ?? 0}%`} sub="Across online GPUs" />
+          <StatCard label="Power draw" icon={Zap} testId="stat-total-power" value={`${stats?.totalPowerKW ?? 0} kW`} sub="Current GPU power, online servers" />
+          <StatCard label="Active alerts" icon={AlertTriangle} tone={stats?.criticalAlerts ? "danger" : stats?.activeAlerts ? "warning" : "default"} testId="stat-critical-alerts"
+            value={stats?.activeAlerts ?? 0}
+            sub={`${stats?.criticalAlerts ?? 0} critical · ${stats?.resolvedToday ?? 0} resolved today`} />
         </div>
-        
-        <div className="flex items-center space-x-3">
-          <Select value={sortBy} onValueChange={setSortBy}>
-            <SelectTrigger className="w-48" data-testid="sort-select">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="name">Sort by Name</SelectItem>
-              <SelectItem value="status">Sort by Status</SelectItem>
-              <SelectItem value="lastSeen">Sort by Last Seen</SelectItem>
-            </SelectContent>
-          </Select>
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={handleRefresh}
-            data-testid="refresh-servers"
-          >
-            <RefreshCw className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
 
-      {/* Server Grid */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6 mb-8">
-        {sortedServers.length === 0 ? (
-          <div className="col-span-full text-center py-12">
-            <HardDrive className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
-            <p className="text-lg font-medium text-foreground">No servers found</p>
-            <p className="text-muted-foreground">
-              {filter === "all" 
-                ? "No servers are currently connected"
-                : `No servers match the "${filter}" filter`
-              }
-            </p>
-          </div>
-        ) : (
-          sortedServers.map((server: any) => (
-            <ServerCard
-              key={server.id}
-              server={server}
-              onClick={() => handleServerClick(server.id)}
-            />
-          ))
+        {fleetHistory.length > 1 && (
+          <Card data-testid="fleet-history">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">Fleet GPU utilization · last 24 h</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <MetricChart data={fleetHistory} rangeHours={24} height={160} domain={[0, 100]} unit="%" type="area"
+                series={[{ key: "util", label: "Avg GPU utilization", color: "var(--chart-1)" }]} />
+            </CardContent>
+          </Card>
         )}
-      </div>
 
-      {/* Recent Alerts Section */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <CardTitle>Recent Alerts</CardTitle>
-            <Button variant="ghost" size="sm" asChild data-testid="view-all-alerts">
-              <a href="/alerts">View all alerts</a>
-            </Button>
+        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3" data-testid="section-servers">
+          <div className="flex flex-wrap items-center gap-2">
+            <h3 className="text-lg font-semibold text-foreground mr-2">Servers</h3>
+            {filters.map(([key, label]) => (
+              <Button key={key} variant={filter === key ? "default" : "ghost"} size="sm" onClick={() => setFilter(key)} data-testid={`filter-${key}`}>
+                {label} <span className="ml-1.5 text-xs opacity-70">{counts[key]}</span>
+              </Button>
+            ))}
           </div>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            {recentAlerts.length === 0 ? (
-              <div className="text-center py-8 text-muted-foreground">
-                No recent alerts
-              </div>
-            ) : (
-              recentAlerts.map((alert: any) => (
-                <AlertItem key={alert.id} alert={alert} />
-              ))
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative lg:hidden">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+              <Input className="pl-8 w-48" placeholder="Search…" defaultValue={q} onKeyDown={(e) => {
+                if (e.key === "Enter") navigate((e.target as HTMLInputElement).value ? `/?q=${encodeURIComponent((e.target as HTMLInputElement).value)}` : "/");
+              }} />
+            </div>
+            {q && (
+              <Button variant="secondary" size="sm" onClick={() => navigate("/")} data-testid="clear-search">
+                “{q}” <X className="h-3 w-3 ml-1" />
+              </Button>
             )}
+            <Select value={tag} onValueChange={setTag}>
+              <SelectTrigger className="w-40" data-testid="tag-filter"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All tags</SelectItem>
+                {tags.map((t) => <SelectItem key={t} value={t}>{t}</SelectItem>)}
+              </SelectContent>
+            </Select>
+            <Select value={sortBy} onValueChange={setSortBy}>
+              <SelectTrigger className="w-44" data-testid="sort-select"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="status">Sort: problems first</SelectItem>
+                <SelectItem value="name">Sort: name</SelectItem>
+                <SelectItem value="gpu">Sort: GPU utilization</SelectItem>
+                <SelectItem value="temp">Sort: GPU temperature</SelectItem>
+                <SelectItem value="power">Sort: power draw</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
-        </CardContent>
-      </Card>
+        </div>
 
-      {/* Server Details Modal */}
-      <ServerModal
-        serverId={selectedServerId}
-        isOpen={!!selectedServerId}
-        onClose={() => setSelectedServerId(null)}
-      />
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4">
+          {isLoading ? (
+            Array.from({ length: 6 }).map((_, i) => <Skeleton key={i} className="h-56" />)
+          ) : visible.length === 0 ? (
+            <div className="col-span-full text-center py-16">
+              <ServerIcon className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
+              {(servers ?? []).length === 0 ? (
+                <>
+                  <p className="text-lg font-medium text-foreground">No servers yet</p>
+                  <p className="text-muted-foreground mb-4">Add your first GPU server and install the collector on it.</p>
+                  {isAdmin && (
+                    <Button asChild><Link href="/servers?add=1"><Plus className="h-4 w-4 mr-2" />Add a server</Link></Button>
+                  )}
+                </>
+              ) : (
+                <>
+                  <p className="text-lg font-medium text-foreground">No server matches these filters</p>
+                  <Button variant="link" onClick={() => { setFilter("all"); setTag("all"); navigate("/"); }}>Reset filters</Button>
+                </>
+              )}
+            </div>
+          ) : (
+            visible.map((server) => <ServerCard key={server.id} server={server} />)
+          )}
+        </div>
+
+        <Card data-testid="section-alerts">
+          <CardHeader className="flex flex-row items-center justify-between space-y-0">
+            <CardTitle>Active alerts</CardTitle>
+            <Button variant="ghost" size="sm" asChild data-testid="view-all-alerts">
+              <Link href="/alerts">View all alerts</Link>
+            </Button>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {recentAlerts.length === 0 ? (
+              <div className="text-center py-6 text-muted-foreground">No active alerts</div>
+            ) : (
+              recentAlerts.map((alert) => <AlertItem key={alert.id} alert={alert} />)
+            )}
+          </CardContent>
+        </Card>
+      </div>
     </div>
   );
 }

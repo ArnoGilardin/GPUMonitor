@@ -1,5 +1,14 @@
 import type { Config } from "tailwindcss";
 
+// Colours are CSS variables holding full colour values; color-mix lets
+// Tailwind opacity modifiers (bg-warning/20, border-success/40...) work with them.
+const withAlpha =
+  (name: string) =>
+  ({ opacityValue }: { opacityValue?: string }) =>
+    opacityValue === undefined || opacityValue === "1"
+      ? `var(${name})`
+      : `color-mix(in srgb, var(${name}) calc(${opacityValue} * 100%), transparent)`;
+
 export default {
   darkMode: ["class"],
   content: ["./client/index.html", "./client/src/**/*.{js,jsx,ts,tsx}"],
@@ -11,59 +20,59 @@ export default {
         sm: "calc(var(--radius) - 4px)",
       },
       colors: {
-        background: "var(--background)",
-        foreground: "var(--foreground)",
+        background: withAlpha("--background"),
+        foreground: withAlpha("--foreground"),
         card: {
-          DEFAULT: "var(--card)",
-          foreground: "var(--card-foreground)",
+          DEFAULT: withAlpha("--card"),
+          foreground: withAlpha("--card-foreground"),
         },
         popover: {
-          DEFAULT: "var(--popover)",
-          foreground: "var(--popover-foreground)",
+          DEFAULT: withAlpha("--popover"),
+          foreground: withAlpha("--popover-foreground"),
         },
         primary: {
-          DEFAULT: "var(--primary)",
-          foreground: "var(--primary-foreground)",
+          DEFAULT: withAlpha("--primary"),
+          foreground: withAlpha("--primary-foreground"),
         },
         secondary: {
-          DEFAULT: "var(--secondary)",
-          foreground: "var(--secondary-foreground)",
+          DEFAULT: withAlpha("--secondary"),
+          foreground: withAlpha("--secondary-foreground"),
         },
         muted: {
-          DEFAULT: "var(--muted)",
-          foreground: "var(--muted-foreground)",
+          DEFAULT: withAlpha("--muted"),
+          foreground: withAlpha("--muted-foreground"),
         },
         accent: {
-          DEFAULT: "var(--accent)",
-          foreground: "var(--accent-foreground)",
+          DEFAULT: withAlpha("--accent"),
+          foreground: withAlpha("--accent-foreground"),
         },
         destructive: {
-          DEFAULT: "var(--destructive)",
-          foreground: "var(--destructive-foreground)",
+          DEFAULT: withAlpha("--destructive"),
+          foreground: withAlpha("--destructive-foreground"),
         },
-        border: "var(--border)",
-        input: "var(--input)",
-        ring: "var(--ring)",
+        border: withAlpha("--border"),
+        input: withAlpha("--input"),
+        ring: withAlpha("--ring"),
         chart: {
-          "1": "var(--chart-1)",
-          "2": "var(--chart-2)",
-          "3": "var(--chart-3)",
-          "4": "var(--chart-4)",
-          "5": "var(--chart-5)",
+          "1": withAlpha("--chart-1"),
+          "2": withAlpha("--chart-2"),
+          "3": withAlpha("--chart-3"),
+          "4": withAlpha("--chart-4"),
+          "5": withAlpha("--chart-5"),
         },
         sidebar: {
-          DEFAULT: "var(--sidebar)",
-          foreground: "var(--sidebar-foreground)",
-          primary: "var(--sidebar-primary)",
-          "primary-foreground": "var(--sidebar-primary-foreground)",
-          accent: "var(--sidebar-accent)",
-          "accent-foreground": "var(--sidebar-accent-foreground)",
-          border: "var(--sidebar-border)",
-          ring: "var(--sidebar-ring)",
+          DEFAULT: withAlpha("--sidebar"),
+          foreground: withAlpha("--sidebar-foreground"),
+          primary: withAlpha("--sidebar-primary"),
+          "primary-foreground": withAlpha("--sidebar-primary-foreground"),
+          accent: withAlpha("--sidebar-accent"),
+          "accent-foreground": withAlpha("--sidebar-accent-foreground"),
+          border: withAlpha("--sidebar-border"),
+          ring: withAlpha("--sidebar-ring"),
         },
-        success: "var(--success)",
-        warning: "var(--warning)",
-        error: "var(--error)",
+        success: withAlpha("--success"),
+        warning: withAlpha("--warning"),
+        error: withAlpha("--error"),
       },
       fontFamily: {
         sans: ["var(--font-sans)"],

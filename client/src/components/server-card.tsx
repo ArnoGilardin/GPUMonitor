@@ -1,216 +1,115 @@
+import { Link } from "wouter";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
-import { Copy, Power } from "lucide-react";
-import { useToast } from "@/hooks/use-toast";
+import { Thermometer, Zap, AlertTriangle, Wrench, Clock } from "lucide-react";
+import { StatusDot, Meter, STATUS_LABELS } from "@/components/status";
+import { timeAgo, formatMB } from "@/lib/format";
 import { cn } from "@/lib/utils";
-import type { Server } from "@shared/schema";
+import type { ServerView } from "@shared/schema";
 
-interface ServerCardProps {
-  server: Server & {
-    status: "online" | "warning" | "error" | "offline";
-    cpuPercent?: number;
-    ramPercent?: number;
-    gpuUtil?: number;
-    gpus?: Array<{
-      name: string;
-      tempC: number;
-      powerW: number;
-    }>;
-    lastSeen?: string;
-  };
-  onClick?: () => void;
-}
-
-export default function ServerCard({ server, onClick }: ServerCardProps) {
-  const { toast } = useToast();
-
-  const getStatusIndicator = (status: string) => {
-    switch (status) {
-      case "online":
-        return "status-online";
-      case "warning":
-        return "status-warning";
-      case "error":
-        return "status-error";
-      default:
-        return "status-offline";
-    }
-  };
-
-  const copyCollectorCommand = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    const command = `docker run -d --name gpu-collector \\
-  -e CENTRAL_API_URL=https://${window.location.host} \\
-  -e CENTRAL_API_KEY=collector-key-123 \\
-  -e SERVER_ID=${server.id} \\
-  --gpus all \\
-  gpu-monitor-collector`;
-    
-    navigator.clipboard.writeText(command);
-    toast({
-      title: "Copied!",
-      description: "Docker command copied to clipboard",
-    });
-  };
-
-  if (server.status === "offline") {
-    return (
-      <Card 
-        className="p-6 opacity-60 cursor-pointer hover:shadow-lg transition-shadow"
-        onClick={onClick}
-        data-testid={`server-card-${server.id}`}
-      >
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center space-x-3">
-            <div className={cn("status-indicator", getStatusIndicator(server.status))}></div>
-            <div>
-              <h4 className="font-semibold text-foreground">{server.name}</h4>
-              <p className="text-sm text-muted-foreground">{server.id}</p>
-            </div>
-          </div>
-          <Badge variant="secondary">Offline</Badge>
-        </div>
-        
-        <div className="text-center py-8">
-          <Power className="h-12 w-12 text-muted-foreground mx-auto mb-2" />
-          <p className="text-sm text-muted-foreground">Server offline</p>
-          <p className="text-xs text-muted-foreground mt-1">
-            Last seen: {server.lastSeen || "Unknown"}
-          </p>
-        </div>
-      </Card>
-    );
-  }
+export default function ServerCard({ server }: { server: ServerView }) {
+  const inactive = server.status === "offline" || server.status === "pending" || server.status === "maintenance";
+  const vramUsed = server.gpus.reduce((s, g) => s + g.vramUsedMB, 0);
+  const vramTotal = server.gpus.reduce((s, g) => s + g.vramTotalMB, 0);
 
   return (
-    <Card 
-      className="p-6 hover:shadow-lg transition-shadow cursor-pointer"
-      onClick={onClick}
-      data-testid={`server-card-${server.id}`}
-    >
-      <div className="flex items-center justify-between mb-4">
-        <div className="flex items-center space-x-3">
-          <div className={cn("status-indicator", getStatusIndicator(server.status))}></div>
-          <div>
-            <h4 className="font-semibold text-foreground">{server.name}</h4>
-            <p className="text-sm text-muted-foreground">{server.id}</p>
-          </div>
-        </div>
-        <div className="flex items-center space-x-2">
-          {server.tags?.map((tag) => (
-            <Badge key={tag} variant="outline" className="text-xs">
-              {tag}
-            </Badge>
-          ))}
-          {server.status === "warning" && (
-            <Badge variant="outline" className="text-xs bg-warning/20 text-warning border-warning/20">
-              Warning
-            </Badge>
-          )}
-          {server.status === "error" && (
-            <Badge variant="destructive" className="text-xs">
-              Critical
-            </Badge>
-          )}
-        </div>
-      </div>
-      
-      <div className="space-y-4">
-        {/* GPU Utilization */}
-        {server.gpuUtil !== undefined && (
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-sm text-muted-foreground">GPU Utilization</span>
-              <span className="text-sm font-medium text-foreground">{server.gpuUtil}%</span>
-            </div>
-            <div className="metric-sparkline"></div>
-          </div>
+    <Link href={`/servers/${server.id}`}>
+      <Card
+        className={cn(
+          "p-5 cursor-pointer hover:border-primary/50 transition-colors h-full flex flex-col",
+          server.status === "error" && "border-error/50",
+          server.status === "warning" && "border-warning/50",
         )}
-        
-        {/* System Metrics */}
-        <div className="grid grid-cols-2 gap-4">
-          {server.cpuPercent !== undefined && (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-xs text-muted-foreground">CPU</span>
-                <span className="text-xs font-medium">{server.cpuPercent}%</span>
-              </div>
-              <Progress 
-                value={server.cpuPercent} 
-                className={cn(
-                  "h-2",
-                  server.cpuPercent > 80 ? "[&>div]:bg-warning" : "[&>div]:bg-chart-1"
-                )}
-              />
+        data-testid={`server-card-${server.id}`}
+      >
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <StatusDot status={server.status} />
+            <div className="min-w-0">
+              <h4 className="font-semibold text-foreground truncate">{server.name}</h4>
+              <p className="text-xs text-muted-foreground truncate">
+                {STATUS_LABELS[server.status]} · {server.gpuCount} GPU{server.gpuCount === 1 ? "" : "s"}
+                {server.location ? ` · ${server.location}` : ""}
+              </p>
             </div>
-          )}
-          {server.ramPercent !== undefined && (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <span className="text-xs text-muted-foreground">RAM</span>
-                <span className="text-xs font-medium">{server.ramPercent}%</span>
-              </div>
-              <Progress 
-                value={server.ramPercent} 
-                className={cn(
-                  "h-2",
-                  server.ramPercent > 85 ? "[&>div]:bg-warning" : "[&>div]:bg-chart-2"
-                )}
-              />
-            </div>
+          </div>
+          {server.activeAlerts > 0 && (
+            <Badge variant="outline" className={cn("shrink-0 gap-1", server.status === "error" ? "text-error border-error/40" : "text-warning border-warning/40")}>
+              <AlertTriangle className="h-3 w-3" /> {server.activeAlerts}
+            </Badge>
           )}
         </div>
-        
-        {/* GPU List */}
-        {server.gpus && server.gpus.length > 0 && (
-          <div>
-            <h5 className="text-xs font-medium text-muted-foreground mb-2">
-              GPUs ({server.gpus.length})
-            </h5>
-            <div className="space-y-2">
-              {server.gpus.slice(0, 2).map((gpu, index) => (
-                <div key={index} className="flex items-center justify-between text-sm">
-                  <span className="text-foreground">{gpu.name}</span>
-                  <div className="flex items-center space-x-2">
-                    <span className={cn(
-                      "text-foreground",
-                      gpu.tempC > 80 ? "text-warning" : "",
-                      gpu.tempC > 85 ? "text-error" : ""
-                    )}>
-                      {gpu.tempC}°C
-                    </span>
-                    <span className="text-muted-foreground">|</span>
-                    <span className="text-foreground">{gpu.powerW}W</span>
+
+        {inactive ? (
+          <div className="flex-1 flex flex-col items-center justify-center py-6 text-center text-muted-foreground">
+            {server.status === "maintenance" ? <Wrench className="h-8 w-8 mb-2" /> : <Clock className="h-8 w-8 mb-2" />}
+            <p className="text-sm">
+              {server.status === "pending"
+                ? "Waiting for the collector's first report"
+                : server.maintenanceWindow
+                  ? `Maintenance until ${new Date(server.maintenanceWindow.endsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}${server.maintenanceWindow.reason ? ` · ${server.maintenanceWindow.reason}` : ""}`
+                  : server.status === "maintenance" ? "In maintenance, alerts are muted" : "No data received"}
+            </p>
+            <p className="text-xs mt-1">Last seen {timeAgo(server.lastSeenAt)}</p>
+          </div>
+        ) : (
+          <div className="space-y-3 flex-1">
+            {server.gpuCount > 0 && (
+              <div>
+                <div className="flex justify-between text-xs mb-1.5">
+                  <span className="text-muted-foreground">GPU utilization</span>
+                  <span className="font-medium">{server.gpuUtil}%</span>
+                </div>
+                {/* one bar per GPU gives a quick view of how evenly work is spread */}
+                <div className="flex gap-1 h-6 items-end" aria-hidden>
+                  {server.gpus.map((g) => (
+                    <div key={g.gpuIndex} className="flex-1 bg-muted rounded-sm h-full relative overflow-hidden" title={`GPU ${g.gpuIndex}: ${g.utilPercent}%`}>
+                      <div
+                        className={cn("absolute bottom-0 inset-x-0 rounded-sm", g.tempC >= 85 ? "bg-error" : g.tempC >= 80 ? "bg-warning" : "bg-chart-1")}
+                        style={{ height: `${Math.max(4, g.utilPercent)}%` }}
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-3 gap-3 text-xs">
+              {[
+                ["CPU", server.cpuPercent],
+                ["RAM", server.ramPercent],
+                ["Disk", server.diskPercent],
+              ].map(([label, value]) => (
+                <div key={label as string}>
+                  <div className="flex justify-between mb-1">
+                    <span className="text-muted-foreground">{label}</span>
+                    <span className="font-medium">{value === null ? "—" : `${Math.round(value as number)}%`}</span>
                   </div>
+                  <Meter value={value as number | null} warn={label === "CPU" ? 85 : 85} crit={95} />
                 </div>
               ))}
-              {server.gpus.length > 2 && (
-                <div className="text-xs text-muted-foreground">
-                  + {server.gpus.length - 2} more GPUs
-                </div>
-              )}
             </div>
+
+            {server.gpuCount > 0 && (
+              <div className="flex items-center justify-between text-xs text-muted-foreground pt-1">
+                <span className="flex items-center gap-1"><Thermometer className="h-3 w-3" /> max {server.maxGpuTempC}°C</span>
+                <span className="flex items-center gap-1"><Zap className="h-3 w-3" /> {server.totalPowerW} W</span>
+                {vramTotal > 0 && <span>VRAM {formatMB(vramUsed)} / {formatMB(vramTotal)}</span>}
+              </div>
+            )}
           </div>
         )}
-        
-        <div className="flex items-center justify-between pt-2 border-t border-border">
-          <span className="text-xs text-muted-foreground">
-            Last seen: {server.lastSeen || "Just now"}
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={copyCollectorCommand}
-            className="text-xs text-primary hover:text-primary"
-            data-testid={`copy-docker-${server.id}`}
-          >
-            <Copy className="h-3 w-3 mr-1" />
-            Copy Docker
-          </Button>
+
+        <div className="flex items-center justify-between gap-2 pt-3 mt-3 border-t border-border">
+          <div className="flex flex-wrap gap-1 min-w-0">
+            {server.tags.slice(0, 3).map((tag) => (
+              <Badge key={tag} variant="outline" className="text-[10px] px-1.5 py-0 font-normal">{tag}</Badge>
+            ))}
+            {server.tags.length > 3 && <span className="text-[10px] text-muted-foreground">+{server.tags.length - 3}</span>}
+          </div>
+          <span className="text-[11px] text-muted-foreground shrink-0">{timeAgo(server.lastSeenAt)}</span>
         </div>
-      </div>
-    </Card>
+      </Card>
+    </Link>
   );
 }

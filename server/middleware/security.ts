@@ -1,6 +1,7 @@
 import helmet from "helmet";
 import slowDown from "express-slow-down";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
+import crypto from "crypto";
 import type { Request, Response, NextFunction } from "express";
 import { storage } from "../storage";
 
@@ -64,27 +65,26 @@ export const authRateLimit = rateLimit({
   },
 });
 
-// API key rate limiting for collector endpoints
+// Rate limiting for collector endpoints: keyed by API key + source IP so that
+// a fleet sharing the global key is not throttled as a single client.
 export const collectorRateLimit = rateLimit({
-  windowMs: 1 * 60 * 1000, // 1 minute
-  max: 120, // Allow frequent requests from collectors
+  windowMs: 1 * 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_INGEST_MAX || "120", 10),
+  standardHeaders: true,
+  legacyHeaders: false,
   keyGenerator: (req) => {
-    // Use API key as identifier instead of IP for collectors
-    const apiKey = req.headers["x-api-key"] as string;
-    if (apiKey) {
-      return `api:${apiKey}`;
-    }
-    // Use default IPv6-safe implementation for non-API requests
-    throw new Error("API key required for collector endpoints");
+    const apiKey = (req.headers["x-api-key"] as string) || "";
+    const keyId = crypto.createHash("sha256").update(apiKey).digest("hex").slice(0, 16);
+    return `api:${keyId}:${ipKeyGenerator(req.ip || "unknown")}`;
   },
   handler: (req: Request, res: Response) => {
     logSecurityEvent({
       eventType: "collector_rate_limit_exceeded",
       severity: "warning",
       ipAddress: req.ip,
-      details: { apiKey: req.headers["x-api-key"], path: req.path },
+      details: { path: req.path },
     });
-    
+
     res.status(429).json({
       message: "Rate limit exceeded for collector API",
       retryAfter: 60,
@@ -137,9 +137,13 @@ export function sanitizeRequest(req: Request, res: Response, next: NextFunction)
   next();
 }
 
+// Credentials and URLs are compared or stored verbatim, never rendered as HTML
+const RAW_FIELDS = new Set(["password", "currentPassword", "newPassword", "refreshToken", "webhook_url", "url"]);
+
 function sanitizeObject(obj: any): void {
   if (obj && typeof obj === "object") {
     for (const key in obj) {
+      if (RAW_FIELDS.has(key)) continue;
       if (typeof obj[key] === "string") {
         // Remove script tags and potential XSS vectors
         obj[key] = obj[key]
